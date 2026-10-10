@@ -31,12 +31,16 @@ def test_register_adds_tool_to_fake_ctx(plugin_module):
             registered["schema"] = schema
             registered["handler"] = handler
             registered["check_fn"] = check_fn
+            registered["description"] = kw.get("description", "")
 
     plugin_module.register(FakeCtx())
     assert registered["name"] == "delegate_task_pro"
     assert registered["toolset"] == "delegation"
     assert callable(registered["handler"])
     assert callable(registered["check_fn"])
+    # The tool listing reads the top-level description; an empty one shows blank.
+    assert registered["description"].strip(), "delegate_task_pro must register a non-empty description"
+    assert "tier" in registered["description"]
 
 
 def test_schema_surface(plugin_module):

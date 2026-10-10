@@ -33,6 +33,32 @@ _PLUGIN_NAME = "delegation-pro"
 _TOOL_NAME = "delegate_task_pro"
 _PLUGIN_CONFIG_KEY = "delegation_pro"
 
+# Top-level tool description (shown in the [delegation] tool listing). Mirrors
+# the stock delegate_task framing so the model treats it as a drop-in, and adds
+# the routing knobs this plugin exists for.
+_TOOL_DESCRIPTION = (
+    "Spawn subagents in isolated contexts; each gets its own conversation, "
+    "terminal session, and toolset, and only its final summary returns to you. "
+    "Same contract as `delegate_task`, plus per-call model routing: pick a `tier` "
+    "(see the tier parameter for the configured tiers) or pass an explicit "
+    "`model`, and set `reasoning_effort` per call.\n\n"
+    "USE FOR: the same work as `delegate_task` (reasoning-heavy subtasks, work that "
+    "would flood your context, independent parallel workstreams) when you also want "
+    "to control which model or how much reasoning the children use -- cheap tiers for "
+    "mechanical work, stronger tiers for reviews, planning, and debugging.\n"
+    "DO NOT USE FOR (use these instead):\n"
+    "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
+    "- A single tool call -> call the tool directly\n"
+    "- Tasks needing user interaction -> subagents cannot ask questions\n\n"
+    "RULES:\n"
+    "- Children know nothing of this conversation: pass everything needed via 'context'.\n"
+    "- Child summaries are SELF-REPORTS: for external side effects require a verifiable "
+    "handle (URL, ID, absolute path) and verify it yourself before reporting success.\n"
+    "- One route per call: every task in a batch runs on the chosen tier; mixed tiers "
+    "mean separate calls.\n"
+    "- An unknown tier warns and falls back to the stock route; the delegation is never lost."
+)
+
 # Reasoning effort levels accepted by hermes_constants.parse_reasoning_effort.
 _EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "maximum")
 
@@ -311,6 +337,7 @@ def register(ctx) -> None:
         schema=_build_schema(),
         handler=_delegate_pro_tool,
         check_fn=check_delegate_requirements,
+        description=_TOOL_DESCRIPTION,
         emoji="\U0001f5fa",
     )
     # Additive inline-executor entry: the agent loop consults this table BEFORE
