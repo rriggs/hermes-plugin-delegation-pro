@@ -152,8 +152,13 @@ def _parse_effort(effort: Any) -> Optional[Dict[str, Any]]:
 
 
 def _known_provider_names(cfg: Optional[dict]) -> set:
-    """Lowercased provider names/aliases known to the runtime, plus any custom
-    ``providers:`` entries declared in the profile config."""
+    """Lowercased provider names/aliases the runtime knows about, plus any custom
+    ``providers:`` entries declared in the profile config.
+
+    NOTE: *cfg* is the ``delegation_pro`` section, which does NOT contain the
+    profile's ``providers:`` block -- that must be read from the full config. A
+    ``providers`` mapping passed directly on *cfg* is still honored (tests).
+    """
     names = set()
     try:
         from providers import list_providers
@@ -166,6 +171,13 @@ def _known_provider_names(cfg: Optional[dict]) -> set:
     except Exception:
         pass
     provs = (cfg or {}).get("providers")
+    if not isinstance(provs, dict):
+        try:
+            from hermes_cli.config import load_config_readonly
+            full = load_config_readonly()
+            provs = full.get("providers") if isinstance(full, dict) else None
+        except Exception:
+            provs = None
     if isinstance(provs, dict):
         names.update(str(k).lower() for k in provs)
     return names

@@ -99,6 +99,15 @@ def test_config_declared_provider_prefix_recognized(plugin_module):
     assert r["credentials_cfg"] == {"model": "glm-5.3", "provider": "hyper"}
 
 
+def test_provider_names_read_from_full_config_not_plugin_section(plugin_module, monkeypatch):
+    # The delegation_pro section has no `providers:` block; the full profile
+    # config does. _known_provider_names must read the FULL config.
+    import hermes_cli.config as hcfg
+    monkeypatch.setattr(hcfg, "load_config_readonly", lambda: {"providers": {"hyper": {"api": "x"}}})
+    names = plugin_module._known_provider_names({"default_tier": "medium"})
+    assert "hyper" in names
+
+
 def test_bare_model_with_slash_not_split_when_prefix_unknown(plugin_module, monkeypatch):
     monkeypatch.setattr(plugin_module, "_known_provider_names", lambda cfg: {"openrouter"})
     r = plugin_module._resolve_route(
