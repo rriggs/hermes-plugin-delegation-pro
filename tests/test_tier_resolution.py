@@ -79,53 +79,29 @@ def test_malformed_config_fails_safe(plugin_module):
     assert "Unknown tier" in r["error"]
 
 
-# --- provider-prefix splitting (provider/model and aggregator/vendor/model) ---
+# --- provider and model are SEPARATE keys (stock delegation-config shape) ---
 
-def test_provider_prefix_split_and_pinned(plugin_module, monkeypatch):
-    monkeypatch.setattr(plugin_module, "_known_provider_names",
-                        lambda cfg: {"openrouter", "local", "hyper"})
-    r = plugin_module._resolve_route(
-        {"tier": "t"}, {"tiers": {"t": {"model": "openrouter/inclusionai/ling-3.1-flash"}}}
-    )
-    assert r["credentials_cfg"] == {"model": "inclusionai/ling-3.1-flash", "provider": "openrouter"}
-
-
-def test_config_declared_provider_prefix_recognized(plugin_module):
-    # custom providers live under `providers:` in the profile config, not the
-    # runtime registry (local llama-cpp, hyper, ...); the splitter must see them.
-    cfg = {"providers": {"hyper": {"api": "x"}},
-           "tiers": {"t": {"model": "hyper/glm-5.3"}}}
+def test_tier_provider_and_model_are_separate_keys(plugin_module):
+    cfg = {"tiers": {"t": {"model": "deepseek/deepseek-v4.1-flash", "provider": "openrouter"}}}
     r = plugin_module._resolve_route({"tier": "t"}, cfg)
-    assert r["credentials_cfg"] == {"model": "glm-5.3", "provider": "hyper"}
+    # the slash in the model id is part of the id, NOT a provider prefix
+    assert r["credentials_cfg"] == {"model": "deepseek/deepseek-v4.1-flash", "provider": "openrouter"}
 
 
-def test_provider_names_read_from_full_config_not_plugin_section(plugin_module, monkeypatch):
-    # The delegation_pro section has no `providers:` block; the full profile
-    # config does. _known_provider_names must read the FULL config.
-    import hermes_cli.config as hcfg
-    monkeypatch.setattr(hcfg, "load_config_readonly", lambda: {"providers": {"hyper": {"api": "x"}}})
-    names = plugin_module._known_provider_names({"default_tier": "medium"})
-    assert "hyper" in names
+def test_tier_without_provider_inherits_parent(plugin_module):
+    cfg = {"tiers": {"t": {"model": "some-model"}}}
+    r = plugin_module._resolve_route({"tier": "t"}, cfg)
+    assert r["credentials_cfg"] == {"model": "some-model"}
 
 
-def test_bare_model_with_slash_not_split_when_prefix_unknown(plugin_module, monkeypatch):
-    monkeypatch.setattr(plugin_module, "_known_provider_names", lambda cfg: {"openrouter"})
-    r = plugin_module._resolve_route(
-        {"tier": "t"}, {"tiers": {"t": {"model": "inclusionai/ling-3.1-flash"}}}
-    )
-    # no 'inclusionai' provider -> pass through whole id, parent provider used
-    assert r["credentials_cfg"] == {"model": "inclusionai/ling-3.1-flash"}
+def test_explicit_model_is_verbatim(plugin_module):
+    r = plugin_module._resolve_route({"model": "deepseek/deepseek-v4.1-flash"}, {})
+    assert r["credentials_cfg"] == {"model": "deepseek/deepseek-v4.1-flash"}
 
 
-def test_explicit_tier_provider_wins_over_model_prefix(plugin_module, monkeypatch):
-    monkeypatch.setattr(plugin_module, "_known_provider_names", lambda cfg: {"openrouter", "hyper"})
-    r = plugin_module._resolve_route(
-        {"tier": "t"}, {"tiers": {"t": {"model": "openrouter/x", "provider": "hyper"}}}
-    )
-    assert r["credentials_cfg"] == {"model": "openrouter/x", "provider": "hyper"}
-
-
-def test_explicit_model_arg_prefix_split(plugin_module, monkeypatch):
-    monkeypatch.setattr(plugin_module, "_known_provider_names", lambda cfg: {"local"})
-    r = plugin_module._resolve_route({"model": "local/qwen3.8-flash-next"}, {})
-    assert r["credentials_cfg"] == {"model": "qwen3.8-flash-next", "provider": "local"}
+def test_tier_provider_base_url_and_model(plugin_module):
+    cfg = {"tiers": {"t": {"model": "m", "provider": "hyper",
+                           "base_url": "https://hyper.charm.land/v1"}}}
+    r = plugin_module._resolve_route({"tier": "t"}, cfg)
+    assert r["credentials_cfg"] == {"model": "m", "provider": "hyper",
+                                    "base_url": "https://hyper.charm.land/v1"}

@@ -11,16 +11,19 @@ Configuration (profile config.yaml):
       default_tier: medium
       tiers:
         small:
-          model: "ollama-cloud/qwen3-8b"
+          provider: openrouter
+          model: inclusionai/ling-3.1-flash
           reasoning_effort: none
           when: "file reads, greps, mechanical edits, format checks"
         large:
-          model: "nous/claude-sonnet-6"
+          provider: hyper
+          model: glm-5.3
           reasoning_effort: high
           when: "reviews, planning, debugging loops, schema design"
 
-If ``delegation_pro`` is absent from config the tool still works, falling back
-to the stock route for everything (an explicit ``model:`` is still honored).
+``provider`` and ``model`` are separate keys, matching the stock ``delegation``
+config section. If ``delegation_pro`` is absent from config the tool still works,
+falling back to the stock route for everything.
 """
 
 import contextlib
@@ -151,62 +154,16 @@ def _parse_effort(effort: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _known_provider_names(cfg: Optional[dict]) -> set:
-    """Lowercased provider names/aliases the runtime knows about, plus any custom
-    ``providers:`` entries declared in the profile config.
-
-    NOTE: *cfg* is the ``delegation_pro`` section, which does NOT contain the
-    profile's ``providers:`` block -- that must be read from the full config. A
-    ``providers`` mapping passed directly on *cfg* is still honored (tests).
-    """
-    names = set()
-    try:
-        from providers import list_providers
-        for p in list_providers():
-            n = getattr(p, "name", None)
-            if n:
-                names.add(str(n).lower())
-            for alias in (getattr(p, "aliases", None) or []):
-                names.add(str(alias).lower())
-    except Exception:
-        pass
-    provs = (cfg or {}).get("providers")
-    if not isinstance(provs, dict):
-        try:
-            from hermes_cli.config import load_config_readonly
-            full = load_config_readonly()
-            provs = full.get("providers") if isinstance(full, dict) else None
-        except Exception:
-            provs = None
-    if isinstance(provs, dict):
-        names.update(str(k).lower() for k in provs)
-    return names
-
-
-def _split_provider_prefix(value: str, cfg: Optional[dict]) -> "tuple[Optional[str], str]":
-    """Split a ``provider/model`` (or ``aggregator/provider/model``) string into
-    ``(provider, model)`` -- the Hermes model-string convention. Splits on the
-    FIRST slash only when that segment names a known/configured provider, so a
-    bare aggregator model id that merely contains a slash (``vendor/model`` with
-    no provider configured) is passed through untouched. Returns ``(None, value)``
-    when there is no recognizable provider prefix."""
-    if not value or "/" not in value:
-        return None, value
-    head, _, rest = value.partition("/")
-    if rest and head.lower() in _known_provider_names(cfg):
-        return head, rest
-    return None, value
-
-
 def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str, Any]:
     """Resolve the per-call route from tool-call args + plugin config.
 
     Returns ``{"credentials_cfg": {…} or None, "reasoning": dict or None, "error": str or None}``.
-    A model may be written ``provider/model`` (or ``aggregator/provider/model``);
-    the provider prefix is split off and pinned, so the child runs on that
-    provider and NOT the parent's. A bare model id with no recognized provider
-    prefix is passed through as-is (the child then uses the parent's provider).
-    An explicit ``provider`` in the tier config wins over a model prefix.
+
+    The route uses the same shape as the stock ``delegation`` config section:
+    ``model`` and ``provider`` are SEPARATE keys. A model id may itself contain a
+    slash (e.g. ``deepseek/deepseek-v4.1-flash`` on openrouter) -- that slash is
+    part of the id, never a provider prefix. Set ``provider`` per tier to pin the
+    child's provider; omit it (and ``base_url``) to inherit the parent's provider.
     """
     cfg = cfg if cfg is not None else _load_plugin_config()
     tiers = _tiers(cfg)
@@ -219,10 +176,7 @@ def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str
     error = None
 
     if explicit_model:
-        provider, model = _split_provider_prefix(explicit_model, cfg)
-        route["model"] = model
-        if provider:
-            route["provider"] = provider
+        route["model"] = explicit_model
     elif tier_name:
         tier = tiers.get(tier_name)
         if not isinstance(tier, dict):
@@ -232,13 +186,9 @@ def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str
             )
         else:
             model = (tier.get("model") or "").strip() or None
-            provider = (tier.get("provider") or "").strip() or None
             if model:
-                if provider:
-                    route["model"] = model            # explicit provider wins over a prefix
-                else:
-                    provider, model = _split_provider_prefix(model, cfg)
-                    route["model"] = model
+                route["model"] = model
+            provider = (tier.get("provider") or "").strip() or None
             if provider:
                 route["provider"] = provider
             base_url = (tier.get("base_url") or "").strip() or None
@@ -355,8 +305,9 @@ def _build_schema(cfg: Optional[dict] = None) -> dict:
             "type": "string",
             "pattern": model_pattern,
             "description": (
-                "Explicit model escape hatch, 'provider/model' or bare model id. Wins over tier. "
-                "Default: inherit the tier route or the parent's model."
+                "Explicit model id escape hatch (bare id, no provider prefix -- a slash in the "
+                "id is part of the model, e.g. 'deepseek/deepseek-v4.1-flash'). Wins over tier. "
+                "The child's provider comes from the tier/config, not from this string."
             ),
         },
         "reasoning_effort": {

@@ -29,27 +29,29 @@ delegation_pro:
   default_tier: medium
   tiers:
     small:
-      model: "ollama-cloud/gemma4:31b"
+      provider: openrouter
+      model: inclusionai/ling-3.1-flash
       reasoning_effort: none
       when: "trivial lookups, file reads, greps, mechanical edits"
     medium:
-      model: "ollama-cloud/minimax-m3"
+      provider: openrouter
+      model: deepseek/deepseek-v4.1-flash
       when: "default delegation: implementation, research, summaries"
     large:
-      model: "ollama-cloud/deepseek-v4-pro:0813"
+      provider: hyper
+      model: glm-5.3
       reasoning_effort: high
       when: "reviews, planning, debugging loops, schema design"
 ```
 
-- `model` — exact model the child runs on. Write it as `provider/model` (or
-  `aggregator/provider/model`), e.g. `openrouter/deepseek/deepseek-v4.1-flash`
-  or `hyper/glm-5.3`; the provider prefix is split off and pinned so the child
-  does NOT inherit the parent's provider. The prefix is recognized only when it
-  names a runtime or config-declared provider; otherwise the whole string is the
-  model id and the parent provider is inherited. An explicit per-tier `provider:`
-  wins over a model prefix. Use LIVE model ids; if the provider retires a tag
-  (404/410), delegation fails loudly rather than falling back (pinned routes
-  intentionally don't borrow the parent's fallback chain).
+- `model` — exact model id the child runs on; `provider` — the provider that
+  serves it. Set BOTH per tier, matching the stock `delegation` config section
+  (`model:` + `provider:` as separate keys). A slash in the model id is part of
+  the id (`deepseek/deepseek-v4.1-flash`), never a provider prefix. Omit
+  `provider` (and `base_url`) to inherit the parent's provider. Use LIVE model
+  ids; if the provider retires a tag (404/410), delegation fails loudly rather
+  than falling back (pinned routes intentionally don't borrow the parent's
+  fallback chain).
 - Optional per-tier: `provider`, `base_url`, `reasoning_effort` (`none` disables
   thinking; any standard level pins it), `when` — surfaced in the tool schema so
   the agent picks tiers by description, not by hardcoding.
