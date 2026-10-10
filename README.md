@@ -52,8 +52,10 @@ delegation_pro:
 
 ## Tool
 
-`delegate_task_pro` mirrors `delegate_task`'s behavior (goal/context/tasks/
-background/output_schema/images/action/steer/stop) and adds:
+`delegate_task_pro` mirrors `delegate_task`'s current behavior (the top-level
+`tasks`/`action`/`subagent_id`/`message` surface, per-task
+`goal`/`context`/`output_schema`/`images`, plus `group` when
+`delegation.independent_completions` is on) and adds:
 
 - `tier` — model tier from config (default: `default_tier`)
 - `model` — explicit `provider/model` escape hatch, wins over tier
@@ -62,6 +64,11 @@ background/output_schema/images/action/steer/stop) and adds:
 The route is pinned per call via the internal `credentials_cfg` hook; children
 are built inside the call, before the sync/background fork, so backgrounded
 batches get the same route.
+
+The plugin also registers a short system-prompt section steering the agent to
+call `delegate_task_pro` instead of `delegate_task` — the stock description
+cannot be edited (core override is gated), so the preference is stated from the
+plugin side.
 
 ## Behavior and safety
 

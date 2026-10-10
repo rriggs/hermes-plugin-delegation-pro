@@ -23,6 +23,7 @@ def test_plugin_shape(plugin_module):
 
 def test_register_adds_tool_to_fake_ctx(plugin_module):
     registered = {}
+    sections = {}
 
     class FakeCtx:
         def register_tool(self, name, toolset, schema, handler, check_fn=None, **kw):
@@ -33,6 +34,10 @@ def test_register_adds_tool_to_fake_ctx(plugin_module):
             registered["check_fn"] = check_fn
             registered["description"] = kw.get("description", "")
 
+        def register_system_prompt_section(self, id, content, **kw):
+            sections["id"] = id
+            sections["content"] = content
+
     plugin_module.register(FakeCtx())
     assert registered["name"] == "delegate_task_pro"
     assert registered["toolset"] == "delegation"
@@ -41,6 +46,9 @@ def test_register_adds_tool_to_fake_ctx(plugin_module):
     # The tool listing reads the top-level description; an empty one shows blank.
     assert registered["description"].strip(), "delegate_task_pro must register a non-empty description"
     assert "tier" in registered["description"]
+    # System-prompt nudge steering agents to the pro tool.
+    assert sections.get("id") == "delegation-pro"
+    assert "delegate_task_pro" in (sections.get("content") or "")
 
 
 def test_schema_surface(plugin_module):
@@ -57,12 +65,14 @@ def test_schema_surface(plugin_module):
     assert schema["parameters"]["type"] == "object"
     props = schema["parameters"]["properties"]
     # stock-compatible passthrough fields
-    for k in ("goal", "context", "tasks", "background", "output_schema", "images",
+    for k in ("goal", "context", "tasks", "output_schema", "images",
               "action", "subagent_id", "message"):
         assert k in props, k
     # pro fields
     for k in ("tier", "model", "reasoning_effort"):
         assert k in props, k
+    # deprecated/ignored stock fields must NOT be advertised
+    assert "background" not in props
     # per-task fields mirror the stock tasks items
     task_props = props["tasks"]["items"]["properties"]
     for k in ("goal", "context", "output_schema", "images"):

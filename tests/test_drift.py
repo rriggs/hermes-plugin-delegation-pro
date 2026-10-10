@@ -78,3 +78,11 @@ def test_delegate_task_schema_uses_nested_parameters():
     from tools.delegate_tool import DELEGATE_TASK_SCHEMA
     assert "parameters" in DELEGATE_TASK_SCHEMA
     assert "properties" in DELEGATE_TASK_SCHEMA["parameters"]
+
+
+def test_plugin_context_exposes_system_prompt_section_api():
+    """The plugin registers a system-prompt section via this ctx method. If it is
+    renamed/removed, the try/except in register() silently drops the nudge — this
+    canary makes that visible."""
+    from hermes_cli.plugins import PluginContext
+    assert hasattr(PluginContext, "register_system_prompt_section")

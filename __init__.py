@@ -63,6 +63,20 @@ _TOOL_DESCRIPTION = (
     "- An unknown tier warns and falls back to the stock route; the delegation is never lost."
 )
 
+# System-prompt section: high-trust bytes charged EVERY turn, so keep it short.
+# This is the enforcement lever the tool description can only suggest (the stock
+# delegate_task description cannot be edited: core override is gated).
+_SYSTEM_PROMPT_SECTION_ID = "delegation-pro"
+_SYSTEM_PROMPT_CONTENT = (
+    "Delegation: delegate with `delegate_task_pro`, not `delegate_task`. It is a "
+    "strict superset (same parameters) that also accepts `tier` (see the tool's "
+    "tier parameter for the configured tiers), an explicit `model`, and per-call "
+    "`reasoning_effort`, and it falls back to the stock route when no tier/model is "
+    "given. Route cheap or mechanical work to a small tier, and reviews, planning, "
+    "and debugging to a stronger one. Call plain `delegate_task` only if "
+    "`delegate_task_pro` is not available."
+)
+
 # Reasoning effort levels accepted by hermes_constants.parse_reasoning_effort.
 _EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "maximum")
 
@@ -295,10 +309,6 @@ def _build_schema(cfg: Optional[dict] = None) -> dict:
             "enum": list(_EFFORT_LEVELS),
             "description": "Per-call reasoning effort. Wins over the tier's level. Omit to inherit.",
         },
-        "background": {
-            "type": "boolean",
-            "description": "Run in background; results re-enter as a new message when subagents finish.",
-        },
         "output_schema": {"type": "object", "description": "Optional JSON Schema the child's final answer must validate against."},
         "images": {"type": "array", "items": {"type": "string"}, "description": "Image paths/URLs the child must SEE."},
         "action": {"type": "string", "enum": ["spawn", "list", "steer", "stop"]},
@@ -351,7 +361,6 @@ def _delegate_pro_tool(args: Dict[str, Any], parent_agent=None, **_ignored) -> A
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=args.get("tasks"),
-        background=args.get("background"),
         output_schema=args.get("output_schema"),
         images=args.get("images"),
         action=args.get("action"),
@@ -406,4 +415,12 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.warning("delegation-pro: could not register inline executor (%s); "
                        "the tool will only work where parent_agent is injected", exc)
+    # System-prompt nudge: steer agents to delegate_task_pro over the stock tool.
+    # Best-effort — an older Hermes without the section API must still register the tool.
+    try:
+        ctx.register_system_prompt_section(_SYSTEM_PROMPT_SECTION_ID, _SYSTEM_PROMPT_CONTENT)
+        logger.info("delegation-pro registered system prompt section %s", _SYSTEM_PROMPT_SECTION_ID)
+    except Exception as exc:
+        logger.warning("delegation-pro: could not register system prompt section (%s); "
+                       "the tool still works but agents get no delegate_task_pro preference nudge", exc)
     logger.info("delegation-pro registered %s", _TOOL_NAME)
