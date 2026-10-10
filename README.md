@@ -41,10 +41,15 @@ delegation_pro:
       when: "reviews, planning, debugging loops, schema design"
 ```
 
-- `model` — exact model the child runs on. Use LIVE model ids; if the provider
-  retires a tag (404/410), delegation fails loudly rather than falling back
-  (pinned routes intentionally don't borrow the parent's fallback chain).
-  Prefer `provider:` + explicit ids over presets.
+- `model` — exact model the child runs on. Write it as `provider/model` (or
+  `aggregator/provider/model`), e.g. `openrouter/deepseek/deepseek-v4.1-flash`
+  or `hyper/glm-5.3`; the provider prefix is split off and pinned so the child
+  does NOT inherit the parent's provider. The prefix is recognized only when it
+  names a runtime or config-declared provider; otherwise the whole string is the
+  model id and the parent provider is inherited. An explicit per-tier `provider:`
+  wins over a model prefix. Use LIVE model ids; if the provider retires a tag
+  (404/410), delegation fails loudly rather than falling back (pinned routes
+  intentionally don't borrow the parent's fallback chain).
 - Optional per-tier: `provider`, `base_url`, `reasoning_effort` (`none` disables
   thinking; any standard level pins it), `when` — surfaced in the tool schema so
   the agent picks tiers by description, not by hardcoding.

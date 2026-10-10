@@ -151,14 +151,50 @@ def _parse_effort(effort: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _known_provider_names(cfg: Optional[dict]) -> set:
+    """Lowercased provider names/aliases known to the runtime, plus any custom
+    ``providers:`` entries declared in the profile config."""
+    names = set()
+    try:
+        from providers import list_providers
+        for p in list_providers():
+            n = getattr(p, "name", None)
+            if n:
+                names.add(str(n).lower())
+            for alias in (getattr(p, "aliases", None) or []):
+                names.add(str(alias).lower())
+    except Exception:
+        pass
+    provs = (cfg or {}).get("providers")
+    if isinstance(provs, dict):
+        names.update(str(k).lower() for k in provs)
+    return names
+
+
+def _split_provider_prefix(value: str, cfg: Optional[dict]) -> "tuple[Optional[str], str]":
+    """Split a ``provider/model`` (or ``aggregator/provider/model``) string into
+    ``(provider, model)`` -- the Hermes model-string convention. Splits on the
+    FIRST slash only when that segment names a known/configured provider, so a
+    bare aggregator model id that merely contains a slash (``vendor/model`` with
+    no provider configured) is passed through untouched. Returns ``(None, value)``
+    when there is no recognizable provider prefix."""
+    if not value or "/" not in value:
+        return None, value
+    head, _, rest = value.partition("/")
+    if rest and head.lower() in _known_provider_names(cfg):
+        return head, rest
+    return None, value
+
+
 def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str, Any]:
     """Resolve the per-call route from tool-call args + plugin config.
 
     Returns ``{"credentials_cfg": {…} or None, "reasoning": dict or None, "error": str or None}``.
-    A pinned model with no provider prefix is passed through as-is; provider is
-    optional in the config (model-only pins are valid — the child will use the
-    parent's provider with this model, and the same-provider inheritance rules
-    in _resolve_child_runtime apply).
+    A model may be written ``provider/model`` (or ``aggregator/provider/model``);
+    the provider prefix is split off and pinned, so the child runs on that
+    provider and NOT the parent's. A bare model id with no recognized provider
+    prefix is passed through as-is (the child then uses the parent's provider).
+    An explicit ``provider`` in the tier config wins over a model prefix.
     """
     cfg = cfg if cfg is not None else _load_plugin_config()
     tiers = _tiers(cfg)
@@ -171,7 +207,10 @@ def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str
     error = None
 
     if explicit_model:
-        route["model"] = explicit_model
+        provider, model = _split_provider_prefix(explicit_model, cfg)
+        route["model"] = model
+        if provider:
+            route["provider"] = provider
     elif tier_name:
         tier = tiers.get(tier_name)
         if not isinstance(tier, dict):
@@ -181,9 +220,13 @@ def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str
             )
         else:
             model = (tier.get("model") or "").strip() or None
-            if model:
-                route["model"] = model
             provider = (tier.get("provider") or "").strip() or None
+            if model:
+                if provider:
+                    route["model"] = model            # explicit provider wins over a prefix
+                else:
+                    provider, model = _split_provider_prefix(model, cfg)
+                    route["model"] = model
             if provider:
                 route["provider"] = provider
             base_url = (tier.get("base_url") or "").strip() or None

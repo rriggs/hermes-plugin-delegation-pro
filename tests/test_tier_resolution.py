@@ -77,3 +77,46 @@ def test_unknown_effort_string_is_not_validated_here(plugin_module):
 def test_malformed_config_fails_safe(plugin_module):
     r = plugin_module._resolve_route({"tier": "big"}, {"tiers": {"big": "not a dict"}})
     assert "Unknown tier" in r["error"]
+
+
+# --- provider-prefix splitting (provider/model and aggregator/vendor/model) ---
+
+def test_provider_prefix_split_and_pinned(plugin_module, monkeypatch):
+    monkeypatch.setattr(plugin_module, "_known_provider_names",
+                        lambda cfg: {"openrouter", "local", "hyper"})
+    r = plugin_module._resolve_route(
+        {"tier": "t"}, {"tiers": {"t": {"model": "openrouter/inclusionai/ling-3.1-flash"}}}
+    )
+    assert r["credentials_cfg"] == {"model": "inclusionai/ling-3.1-flash", "provider": "openrouter"}
+
+
+def test_config_declared_provider_prefix_recognized(plugin_module):
+    # custom providers live under `providers:` in the profile config, not the
+    # runtime registry (local llama-cpp, hyper, ...); the splitter must see them.
+    cfg = {"providers": {"hyper": {"api": "x"}},
+           "tiers": {"t": {"model": "hyper/glm-5.3"}}}
+    r = plugin_module._resolve_route({"tier": "t"}, cfg)
+    assert r["credentials_cfg"] == {"model": "glm-5.3", "provider": "hyper"}
+
+
+def test_bare_model_with_slash_not_split_when_prefix_unknown(plugin_module, monkeypatch):
+    monkeypatch.setattr(plugin_module, "_known_provider_names", lambda cfg: {"openrouter"})
+    r = plugin_module._resolve_route(
+        {"tier": "t"}, {"tiers": {"t": {"model": "inclusionai/ling-3.1-flash"}}}
+    )
+    # no 'inclusionai' provider -> pass through whole id, parent provider used
+    assert r["credentials_cfg"] == {"model": "inclusionai/ling-3.1-flash"}
+
+
+def test_explicit_tier_provider_wins_over_model_prefix(plugin_module, monkeypatch):
+    monkeypatch.setattr(plugin_module, "_known_provider_names", lambda cfg: {"openrouter", "hyper"})
+    r = plugin_module._resolve_route(
+        {"tier": "t"}, {"tiers": {"t": {"model": "openrouter/x", "provider": "hyper"}}}
+    )
+    assert r["credentials_cfg"] == {"model": "openrouter/x", "provider": "hyper"}
+
+
+def test_explicit_model_arg_prefix_split(plugin_module, monkeypatch):
+    monkeypatch.setattr(plugin_module, "_known_provider_names", lambda cfg: {"local"})
+    r = plugin_module._resolve_route({"model": "local/qwen3.8-flash-next"}, {})
+    assert r["credentials_cfg"] == {"model": "qwen3.8-flash-next", "provider": "local"}
