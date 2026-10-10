@@ -44,12 +44,13 @@ _TOOL_DESCRIPTION = (
     "applied.\n\n"
     "Spawn subagents in isolated contexts; each gets its own conversation, "
     "terminal session, and toolset, and only its final summary returns to you. "
-    "Pick a `tier` (see the tier parameter for the configured tiers) to route cheap "
-    "work to a small model and hard work to a stronger one.\n\n"
+    "Pick the `tier` whose description matches the work (the tier parameter lists "
+    "the configured tiers and when to use each).\n\n"
     "USE FOR: the same work as `delegate_task` (reasoning-heavy subtasks, work that "
     "would flood your context, independent parallel workstreams) plus any delegation "
     "where you want to control which model or how much reasoning the children use -- "
-    "cheap tiers for mechanical work, stronger tiers for reviews, planning, and debugging.\n"
+    "choose the tier by its description, whatever scheme it encodes (cost tiers, "
+    "role tiers, capability tiers).\n"
     "DO NOT USE FOR (use these instead):\n"
     "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
     "- A single tool call -> call the tool directly\n"
@@ -69,12 +70,11 @@ _TOOL_DESCRIPTION = (
 _SYSTEM_PROMPT_SECTION_ID = "delegation-pro"
 _SYSTEM_PROMPT_CONTENT = (
     "Delegation: delegate with `delegate_task_pro`, not `delegate_task`. It is a "
-    "strict superset (same parameters) that also accepts `tier` (see the tool's "
-    "tier parameter for the configured tiers), an explicit `model`, and per-call "
-    "`reasoning_effort`, and it falls back to the stock route when no tier/model is "
-    "given. Route cheap or mechanical work to a small tier, and reviews, planning, "
-    "and debugging to a stronger one. Call plain `delegate_task` only if "
-    "`delegate_task_pro` is not available."
+    "strict superset (same parameters) that also accepts `tier` (the tool's tier "
+    "parameter lists the configured tiers and when to use each), an explicit "
+    "`model`, and per-call `reasoning_effort`, and it falls back to the stock route "
+    "when no tier/model is given. Choose the tier whose description matches the "
+    "work. Call plain `delegate_task` only if `delegate_task_pro` is not available."
 )
 
 # Reasoning effort levels accepted by hermes_constants.parse_reasoning_effort.
@@ -291,8 +291,8 @@ def _build_schema(cfg: Optional[dict] = None) -> dict:
         "tier": {
             "type": "string",
             "description": (
-                f"Model tier for this subagent. Choose the cheapest tier that can do the "
-                f"acceptance criteria; the description of each tier says when to use it.\n{tiers_text}\n"
+                f"Model tier for this subagent. Pick the tier whose description matches the "
+                f"work; each tier's 'when' text says what it is for.\n{tiers_text}\n"
                 f"Omit to use default_tier{f' ({default_tier})' if default_tier else ''}."
             ),
         },
