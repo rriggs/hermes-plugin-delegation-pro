@@ -37,15 +37,19 @@ _PLUGIN_CONFIG_KEY = "delegation_pro"
 # the stock delegate_task framing so the model treats it as a drop-in, and adds
 # the routing knobs this plugin exists for.
 _TOOL_DESCRIPTION = (
+    "PREFER THIS TOOL over `delegate_task` for delegation. It is a strict superset: "
+    "the same parameters plus per-call model routing (`tier` or an explicit `model`) and "
+    "`reasoning_effort`. With no `tier`/`model` it follows the profile's configured "
+    "default tier. Use plain `delegate_task` only when you deliberately want no tier "
+    "applied.\n\n"
     "Spawn subagents in isolated contexts; each gets its own conversation, "
     "terminal session, and toolset, and only its final summary returns to you. "
-    "Same contract as `delegate_task`, plus per-call model routing: pick a `tier` "
-    "(see the tier parameter for the configured tiers) or pass an explicit "
-    "`model`, and set `reasoning_effort` per call.\n\n"
+    "Pick a `tier` (see the tier parameter for the configured tiers) to route cheap "
+    "work to a small model and hard work to a stronger one.\n\n"
     "USE FOR: the same work as `delegate_task` (reasoning-heavy subtasks, work that "
-    "would flood your context, independent parallel workstreams) when you also want "
-    "to control which model or how much reasoning the children use -- cheap tiers for "
-    "mechanical work, stronger tiers for reviews, planning, and debugging.\n"
+    "would flood your context, independent parallel workstreams) plus any delegation "
+    "where you want to control which model or how much reasoning the children use -- "
+    "cheap tiers for mechanical work, stronger tiers for reviews, planning, and debugging.\n"
     "DO NOT USE FOR (use these instead):\n"
     "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
     "- A single tool call -> call the tool directly\n"
@@ -80,6 +84,43 @@ def _load_plugin_config() -> dict:
 def _tiers(cfg: dict) -> dict:
     tiers = cfg.get("tiers")
     return tiers if isinstance(tiers, dict) else {}
+
+
+def _tasks_description() -> str:
+    """The 'tasks' parameter text with the live concurrency limit. Reuse stock's
+    builder so the limit text never drifts; fall back to a static string."""
+    try:
+        from tools.delegate_tool import _build_tasks_param_description
+        return _build_tasks_param_description()
+    except Exception:
+        return (
+            "The task(s): each entry spawns one subagent with isolated context and "
+            "terminal session; a single task is a one-entry array. Required when spawning."
+        )
+
+
+def _independent_completions_enabled() -> bool:
+    """Whether delegation.independent_completions is on (gates the per-task 'group'
+    key). Permissive on probe failure so the capability is not silently hidden."""
+    try:
+        from tools.delegate_tool_config import _get_independent_completions
+        return bool(_get_independent_completions())
+    except Exception:
+        return True
+
+
+def _task_item_properties() -> dict:
+    """Per-task fields, mirroring the stock delegate_task 'tasks' items. 'group' is
+    advertised only when independent completions is enabled (stock does the same)."""
+    props = {
+        "goal": {"type": "string"},
+        "context": {"type": "string"},
+        "output_schema": {"type": "object", "description": "Optional JSON Schema this child's final answer must validate against."},
+        "images": {"type": "array", "items": {"type": "string"}, "description": "Images this child must SEE (local paths or URLs)."},
+    }
+    if _independent_completions_enabled():
+        props["group"] = {"type": "string", "description": "Optional result-delivery bucket within this call (only when delegation.independent_completions is enabled)."}
+    return props
 
 
 def _parse_effort(effort: Any) -> Optional[Dict[str, Any]]:
@@ -219,56 +260,69 @@ def _build_schema(cfg: Optional[dict] = None) -> dict:
 
     model_pattern = r"^[a-zA-Z0-9._/-]+$"
 
-    return {
-        "type": "object",
-        "description": _TOOL_DESCRIPTION,
-        "properties": {
-            "goal": {"type": "string", "description": "What this subagent should accomplish. Be specific and self-contained."},
-            "context": {"type": "string", "description": "Background this child needs: file paths, error messages, constraints."},
-            "tasks": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "goal": {"type": "string"},
-                        "context": {"type": "string"},
-                    },
-                    "required": ["goal"],
-                    "additionalProperties": False,
-                },
+    properties = {
+        "goal": {"type": "string", "description": "What this subagent should accomplish. Be specific and self-contained."},
+        "context": {"type": "string", "description": "Background this child needs: file paths, error messages, constraints."},
+        "tasks": {
+            "type": "array",
+            "minItems": 1,
+            "description": _tasks_description(),
+            "items": {
+                "type": "object",
+                "properties": _task_item_properties(),
+                "required": ["goal"],
+                "additionalProperties": False,
             },
-            "tier": {
-                "type": "string",
-                "description": (
-                    f"Model tier for this subagent. Choose the cheapest tier that can do the "
-                    f"acceptance criteria; the description of each tier says when to use it.\n{tiers_text}\n"
-                    f"Omit to use default_tier{f' ({default_tier})' if default_tier else ''}."
-                ),
-            },
-            "model": {
-                "type": "string",
-                "pattern": model_pattern,
-                "description": (
-                    "Explicit model escape hatch, 'provider/model' or bare model id. Wins over tier. "
-                    "Default: inherit the tier route or the parent's model."
-                ),
-            },
-            "reasoning_effort": {
-                "type": "string",
-                "enum": list(_EFFORT_LEVELS),
-                "description": "Per-call reasoning effort. Wins over the tier's level. Omit to inherit.",
-            },
-            "background": {
-                "type": "boolean",
-                "description": "Run in background; results re-enter as a new message when subagents finish.",
-            },
-            "output_schema": {"type": "object", "description": "Optional JSON Schema the child's final answer must validate against."},
-            "images": {"type": "array", "items": {"type": "string"}, "description": "Image paths/URLs the child must SEE."},
-            "action": {"type": "string", "enum": ["spawn", "list", "steer", "stop"]},
-            "subagent_id": {"type": "string", "description": "Target for action='steer'/'stop'."},
-            "message": {"type": "string", "description": "For action='steer': the course correction."},
         },
-        "required": [],
+        "tier": {
+            "type": "string",
+            "description": (
+                f"Model tier for this subagent. Choose the cheapest tier that can do the "
+                f"acceptance criteria; the description of each tier says when to use it.\n{tiers_text}\n"
+                f"Omit to use default_tier{f' ({default_tier})' if default_tier else ''}."
+            ),
+        },
+        "model": {
+            "type": "string",
+            "pattern": model_pattern,
+            "description": (
+                "Explicit model escape hatch, 'provider/model' or bare model id. Wins over tier. "
+                "Default: inherit the tier route or the parent's model."
+            ),
+        },
+        "reasoning_effort": {
+            "type": "string",
+            "enum": list(_EFFORT_LEVELS),
+            "description": "Per-call reasoning effort. Wins over the tier's level. Omit to inherit.",
+        },
+        "background": {
+            "type": "boolean",
+            "description": "Run in background; results re-enter as a new message when subagents finish.",
+        },
+        "output_schema": {"type": "object", "description": "Optional JSON Schema the child's final answer must validate against."},
+        "images": {"type": "array", "items": {"type": "string"}, "description": "Image paths/URLs the child must SEE."},
+        "action": {"type": "string", "enum": ["spawn", "list", "steer", "stop"]},
+        "subagent_id": {"type": "string", "description": "Target for action='steer'/'stop'."},
+        "message": {"type": "string", "description": "For action='steer': the course correction."},
+    }
+
+    # Function-calling shape: the model receives this as function.parameters.
+    # registry.get_definitions() does {**entry.schema, "name": entry.name}, so the
+    # parameter object MUST be nested under "parameters" (like DELEGATE_TASK_SCHEMA
+    # in tools/delegate_tool.py) — a flat {type, properties, required} lands as
+    # siblings of "name" and the model sees NO parameters at all.
+    #
+    # Unlike stock delegate_task we cannot register dynamic_schema_overrides here:
+    # PluginContext.register_tool() does not forward that kwarg (only raw
+    # registry.register does), so the tasks text is baked at registration time.
+    return {
+        "name": _TOOL_NAME,
+        "description": _TOOL_DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "properties": properties,
+            "required": [],
+        },
     }
 
 

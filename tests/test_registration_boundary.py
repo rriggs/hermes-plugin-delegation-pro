@@ -49,12 +49,13 @@ def test_schema_surface(plugin_module):
         "large": {"model": "prov/big", "when": "deep work"},
     }}
     schema = plugin_module._build_schema(cfg)
-    assert schema["type"] == "object"
-    # The definition sent to the model (registry.get_definitions) reads the
-    # description from the schema, not register_tool(description=...).
+    # Function-calling shape: description at the schema top level (that is what
+    # registry.get_definitions surfaces), parameters nested under "parameters".
     assert schema.get("description", "").strip(), "schema must carry a top-level description"
     assert "tier" in schema["description"]
-    props = schema["properties"]
+    assert "parameters" in schema, "schema must nest the parameter object under 'parameters'"
+    assert schema["parameters"]["type"] == "object"
+    props = schema["parameters"]["properties"]
     # stock-compatible passthrough fields
     for k in ("goal", "context", "tasks", "background", "output_schema", "images",
               "action", "subagent_id", "message"):
@@ -62,15 +63,30 @@ def test_schema_surface(plugin_module):
     # pro fields
     for k in ("tier", "model", "reasoning_effort"):
         assert k in props, k
+    # per-task fields mirror the stock tasks items
+    task_props = props["tasks"]["items"]["properties"]
+    for k in ("goal", "context", "output_schema", "images"):
+        assert k in task_props, k
     # tier descriptions surface 'when' text and the default marker
     tier_desc = props["tier"]["description"]
     assert "trivial" in tier_desc and "deep work" in tier_desc
     assert "- small" in tier_desc and "(default)" in tier_desc
 
 
+def test_schema_definition_shape_definitions_ready(plugin_module):
+    """Guard the exact bug that made the tool render with no parameters: the
+    registry builds {**schema, name}, so 'parameters' must be nested."""
+    schema = plugin_module._build_schema({})
+    fn = {**schema, "name": plugin_module._TOOL_NAME}
+    assert "parameters" in fn
+    assert isinstance(fn["parameters"].get("properties"), dict) and fn["parameters"]["properties"]
+    # a flat schema would leave properties as a sibling of 'name' with no parameters
+    assert "properties" not in fn or fn.get("parameters")
+
+
 def test_schema_default_without_entry(plugin_module):
     cfg = {"default_tier": "medium", "tiers": {"small": {"model": "prov/mini"}}}
-    desc = plugin_module._build_schema(cfg)["properties"]["tier"]["description"]
+    desc = plugin_module._build_schema(cfg)["parameters"]["properties"]["tier"]["description"]
     assert "no tiers entry" in desc
 
 

@@ -55,3 +55,26 @@ def test_concurrent_path_consults_inline_table():
     registry for non-delegate_task names."""
     src = (Path(HERMES_SRC) / "agent" / "tool_executor.py").read_text()
     assert "INLINE_TOOL_EXECUTORS" in src
+
+
+def test_stock_tasks_description_builder_present():
+    """The plugin reuses stock's tasks-parameter text builder so its concurrency
+    limit text does not drift."""
+    from tools.delegate_tool import _build_tasks_param_description
+    assert callable(_build_tasks_param_description)
+    assert isinstance(_build_tasks_param_description(), str)
+
+
+def test_stock_independent_completions_probe_present():
+    """The plugin gates the per-task 'group' key on this stock probe."""
+    from tools.delegate_tool_config import _get_independent_completions
+    assert callable(_get_independent_completions)
+
+
+def test_delegate_task_schema_uses_nested_parameters():
+    """Pin the contract the plugin must match: DELEGATE_TASK_SCHEMA nests the
+    parameter object under 'parameters' (not flat properties). If stock changes
+    shape, the plugin's schema builders must follow."""
+    from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+    assert "parameters" in DELEGATE_TASK_SCHEMA
+    assert "properties" in DELEGATE_TASK_SCHEMA["parameters"]
