@@ -1,5 +1,7 @@
 # hermes-plugin-delegation-pro
 
+![Delegation Pro Logo](delegation_pro.jpeg)
+
 Enhanced task delegation for Hermes Agent: per-call **model selection** (tiered)
 and per-call **reasoning_effort**, without touching the Hermes source tree.
 
