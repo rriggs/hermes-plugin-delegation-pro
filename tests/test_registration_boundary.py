@@ -50,6 +50,10 @@ def test_schema_surface(plugin_module):
     }}
     schema = plugin_module._build_schema(cfg)
     assert schema["type"] == "object"
+    # The definition sent to the model (registry.get_definitions) reads the
+    # description from the schema, not register_tool(description=...).
+    assert schema.get("description", "").strip(), "schema must carry a top-level description"
+    assert "tier" in schema["description"]
     props = schema["properties"]
     # stock-compatible passthrough fields
     for k in ("goal", "context", "tasks", "background", "output_schema", "images",

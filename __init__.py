@@ -221,6 +221,7 @@ def _build_schema(cfg: Optional[dict] = None) -> dict:
 
     return {
         "type": "object",
+        "description": _TOOL_DESCRIPTION,
         "properties": {
             "goal": {"type": "string", "description": "What this subagent should accomplish. Be specific and self-contained."},
             "context": {"type": "string", "description": "Background this child needs: file paths, error messages, constraints."},
