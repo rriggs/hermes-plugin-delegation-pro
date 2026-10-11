@@ -80,9 +80,43 @@ def test_delegate_task_schema_uses_nested_parameters():
     assert "properties" in DELEGATE_TASK_SCHEMA["parameters"]
 
 
+def test_sequential_deadline_exempt_set_present(plugin_module):
+    """The plugin exempts delegate_task_pro from the generic sequential tool
+    deadline by extending agent.tool_executor._SEQUENTIAL_DEADLINE_EXEMPT_TOOLS
+    at registration (mirroring the stock delegate_task exemption). If the module
+    or set is renamed/removed upstream, the exemption silently stops working and
+    long children are abandoned by the ~420s deadline with their completion
+    undelivered — make that loud instead."""
+    import agent.tool_executor as te
+
+    if not hasattr(te, "_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS"):
+        raise AssertionError(
+            "agent.tool_executor._SEQUENTIAL_DEADLINE_EXEMPT_TOOLS is gone upstream — "
+            "delegation-pro's deadline exemption no-ops and children that outlive the "
+            "sequential deadline are orphaned. Inspect the new exemption mechanism and "
+            "retarget the registration hook in register()."
+        )
+
+    class FakeCtx:
+        def register_tool(self, *a, **kw):
+            pass
+
+        def register_system_prompt_section(self, *a, **kw):
+            pass
+
+    before = frozenset(te._SEQUENTIAL_DEADLINE_EXEMPT_TOOLS)
+    plugin_module.register(FakeCtx())
+    after = te._SEQUENTIAL_DEADLINE_EXEMPT_TOOLS
+    assert "delegate_task_pro" in after, (
+        "register() did not exempt delegate_task_pro from the sequential deadline; "
+        "long children will be abandoned by the ~420s tool deadline."
+    )
+    # Additive: stock exemptions must survive the plugin's mutation.
+    for name in ("delegate_task", "manage_connections"):
+        if name in before:
+            assert name in after, f"plugin registration dropped the stock exemption for {name}"
+
+
 def test_plugin_context_exposes_system_prompt_section_api():
-    """The plugin registers a system-prompt section via this ctx method. If it is
-    renamed/removed, the try/except in register() silently drops the nudge — this
-    canary makes that visible."""
     from hermes_cli.plugins import PluginContext
     assert hasattr(PluginContext, "register_system_prompt_section")

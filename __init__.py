@@ -421,6 +421,36 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.warning("delegation-pro: could not register inline executor (%s); "
                        "the tool will only work where parent_agent is injected", exc)
+    # Sequential-deadline exemption: the stock delegate_task is exempt from the
+    # generic sequential tool deadline (agent/tool_executor.
+    # _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS) because a delegation call blocks for the
+    # whole batch by design and its children supervise their own liveness. The
+    # plugin tool dispatches through the same inline-executor path, so it must be
+    # exempt too — otherwise a long child (child_timeout_seconds up to 600s)
+    # outlives the ~420s deadline, the parent's tool call dies with tool_timeout,
+    # and the child's eventual completion is never delivered (Milo, 2026-10-10:
+    # child completed cleanly at 605s after the parent call was killed at 420s).
+    # Extending the module-level frozenset is additive and mirrors exactly what
+    # upstream did for delegate_task; a read-back assertion below makes a silent
+    # failure impossible. If the module/set moved (drift), we warn loudly and
+    # operators should set timeouts.tools.sequential_call >= delegation.
+    # child_timeout_seconds in config.yaml as the fallback.
+    deadline_exempt = False
+    try:
+        import agent.tool_executor as _te
+        exempt: set = set(getattr(_te, "_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS", ()))
+        exempt.add(_TOOL_NAME)
+        _te._SEQUENTIAL_DEADLINE_EXEMPT_TOOLS = frozenset(exempt)
+        deadline_exempt = _TOOL_NAME in _te._SEQUENTIAL_DEADLINE_EXEMPT_TOOLS
+    except Exception as exc:
+        logger.warning(
+            "delegation-pro: could not exempt %s from the sequential tool deadline (%s); "
+            "long children may be abandoned by the ~420s deadline with their completion "
+            "undelivered. Fallback: set timeouts.tools.sequential_call >= delegation."
+            "child_timeout_seconds in config.yaml.", _TOOL_NAME, exc,
+        )
+    if deadline_exempt:
+        logger.info("delegation-pro exempted %s from the sequential tool deadline", _TOOL_NAME)
     # System-prompt nudge: steer agents to delegate_task_pro over the stock tool.
     # Best-effort — an older Hermes without the section API must still register the tool.
     try:

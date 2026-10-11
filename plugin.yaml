@@ -1,5 +1,5 @@
 name: delegation-pro
-version: 0.1.0
+version: 0.1.1
 description: "Enhanced delegate_task: per-call model tier selection and reasoning_effort, without touching Hermes core."
 author: Rob Riggs (rriggs)
 license: MIT
