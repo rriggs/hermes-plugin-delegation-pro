@@ -4,7 +4,6 @@ If any of these fail after a hermes update, the plugin's delegation pathway
 may have changed: check what moved in the Hermes source before deploying a
 pinned-route delegation again.
 """
-import inspect
 import sys
 from pathlib import Path
 
@@ -14,27 +13,37 @@ from conftest import HERMES_SRC  # noqa: E402
 sys.path.insert(0, HERMES_SRC)
 
 
-def test_credentials_cfg_kwarg_still_exists():
-    """delegate_task() must still accept credentials_cfg (the per-call route)."""
-    from tools.delegate_tool import delegate_task
-    sig = inspect.signature(delegate_task)
-    assert "credentials_cfg" in sig.parameters, (
-        "delegate_task no longer accepts credentials_cfg — the per-call routing "
-        "pathway has changed upstream. delegation-pro needs a new hook; do NOT "
-        "deploy this version of the plugin."
+def test_lifecycle_request_accepts_reasoning_effort():
+    """SubagentLaunchRequest must still carry reasoning_effort (the per-call
+    reasoning override this plugin passes)."""
+    from agent.subagent_lifecycle import SubagentLaunchRequest
+    import dataclasses
+    field_names = {f.name for f in dataclasses.fields(SubagentLaunchRequest)}
+    assert "reasoning_effort" in field_names, (
+        "SubagentLaunchRequest no longer accepts reasoning_effort — the "
+        "per-call reasoning pathway has changed upstream. Do NOT deploy this "
+        "version of the plugin until retargeted."
     )
 
 
-def test_reasoning_effort_read_site_still_present():
-    """_resolve_child_runtime must still read reasoning_effort from the
-    delegation config section — the plugin's scoped patch targets this read."""
-    src = (Path(HERMES_SRC) / "tools" / "delegate_tool_config.py").read_text()
-    assert "reasoning_effort" in src, (
-        "delegation reasoning_effort resolution no longer lives in "
-        "delegate_tool_config.py — the scoped _load_config patch will no-op. "
-        "Inspect where the read moved and retarget the patch."
+def test_lifecycle_request_maps_and_normalizes_effort():
+    """The service must normalize effort via hermes' canonical parser and
+    reject invalid values before a child is built."""
+    from agent.subagent_lifecycle import SubagentLifecycleError
+    from hermes_constants import parse_reasoning_effort
+    assert parse_reasoning_effort("high") == {"enabled": True, "effort": "high"}
+    assert parse_reasoning_effort(False) == {"enabled": False}
+    assert parse_reasoning_effort("warp") is None  # unrecognized -> service rejects
+
+
+def test_plugin_context_exposes_lifecycle_facade():
+    """ctx.subagent_lifecycle is the plugin's launch surface; if the property
+    moves, every delegate_task_pro call fails at handler time."""
+    from hermes_cli.plugins import PluginContext
+    assert hasattr(PluginContext, "subagent_lifecycle"), (
+        "PluginContext.subagent_lifecycle is gone upstream — delegate_task_pro "
+        "can no longer launch children. Retarget _lifecycle_service()."
     )
-    assert 'delegation_cfg.get("reasoning_effort")' in src
 
 
 def test_stock_check_fn_importable():
@@ -50,34 +59,59 @@ def test_inline_executor_table_importable():
     assert "delegate_task" in INLINE_TOOL_EXECUTORS
 
 
-def test_concurrent_path_consults_inline_table():
+def test_sequential_path_consults_inline_table():
     """tool_executor sequential path checks INLINE_TOOL_EXECUTORS before the
     registry for non-delegate_task names."""
     src = (Path(HERMES_SRC) / "agent" / "tool_executor.py").read_text()
     assert "INLINE_TOOL_EXECUTORS" in src
 
 
-def test_stock_tasks_description_builder_present():
-    """The plugin reuses stock's tasks-parameter text builder so its concurrency
-    limit text does not drift."""
-    from tools.delegate_tool import _build_tasks_param_description
-    assert callable(_build_tasks_param_description)
-    assert isinstance(_build_tasks_param_description(), str)
+def test_launch_never_touches_delegate_config_loader(plugin_module, monkeypatch):
+    """Behavioral monkeypatch canary: a routed launch must not read or rebind
+    tools.delegate_tool._load_config. The v1 plugin patched that loader to
+    inject reasoning_effort (a core override that blocked catalog admission);
+    the lifecycle path must make the patch structurally impossible — this test
+    proves the old pathway stays dead, not just that a symbol is gone."""
+    import tools.delegate_tool as dt
 
+    class Boom(Exception):
+        pass
 
-def test_stock_independent_completions_probe_present():
-    """The plugin gates the per-task 'group' key on this stock probe."""
-    from tools.delegate_tool_config import _get_independent_completions
-    assert callable(_get_independent_completions)
+    def _refuse(*_a, **_k):
+        raise Boom("delegate_task_pro must not load delegation config directly")
 
+    monkeypatch.setattr(dt, "_load_config", _refuse)
 
-def test_delegate_task_schema_uses_nested_parameters():
-    """Pin the contract the plugin must match: DELEGATE_TASK_SCHEMA nests the
-    parameter object under 'parameters' (not flat properties). If stock changes
-    shape, the plugin's schema builders must follow."""
-    from tools.delegate_tool import DELEGATE_TASK_SCHEMA
-    assert "parameters" in DELEGATE_TASK_SCHEMA
-    assert "properties" in DELEGATE_TASK_SCHEMA["parameters"]
+    class FakeLifecycle:
+        def __init__(self):
+            self.requests = []
+
+        def launch(self, request):
+            self.requests.append(request)
+            return object()
+
+        def wait(self, handle, timeout_seconds=None):
+            return type("T", (), {"state": "SUCCEEDED", "timed_out": False})()
+
+        def result(self, handle):
+            return type("R", (), {"summary": "ok", "error_classification": None,
+                                  "error_message": None})()
+
+    class FakeCtx:
+        def __init__(self, service):
+            self.subagent_lifecycle = service
+
+    svc = FakeLifecycle()
+    monkeypatch.setattr(plugin_module, "_plugin_ctx", FakeCtx(svc))
+    monkeypatch.setattr(plugin_module, "_load_plugin_config",
+                        lambda: {"tiers": {"big": {"model": "m", "reasoning_effort": "high"}}})
+
+    out = plugin_module._delegate_pro_tool({"goal": "g", "tier": "big"},
+                                           parent_agent=object())
+    assert len(svc.requests) == 1
+    assert "Error" not in out
+    assert svc.requests[0].reasoning_effort == "high"
+    # _load_config still patched to refuse: proving the handler never called it.
 
 
 def test_sequential_deadline_exempt_set_present(plugin_module):
@@ -105,7 +139,11 @@ def test_sequential_deadline_exempt_set_present(plugin_module):
             pass
 
     before = frozenset(te._SEQUENTIAL_DEADLINE_EXEMPT_TOOLS)
-    plugin_module.register(FakeCtx())
+    prev_ctx = plugin_module._plugin_ctx
+    try:
+        plugin_module.register(FakeCtx())
+    finally:
+        plugin_module._plugin_ctx = prev_ctx  # never leak between tests
     after = te._SEQUENTIAL_DEADLINE_EXEMPT_TOOLS
     assert "delegate_task_pro" in after, (
         "register() did not exempt delegate_task_pro from the sequential deadline; "

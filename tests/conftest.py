@@ -37,8 +37,9 @@ SAMPLE_CFG = {
         "small": {"model": "prov/mini", "reasoning_effort": "none",
                    "when": "trivial reads and greps"},
         "medium": {"model": "prov/mid", "when": "default work"},
-        "large": {"model": "prov/big", "reasoning_effort": "high",
+        "large": {"model": "prov/big", "provider": "prov",
+                   "reasoning_effort": "high",
                    "when": "reviews, planning, debugging"},
-        "local": {"model": "bare-no-prefix", "base_url": "http://localhost:9999/v1"},
+        "off": {"model": "m", "reasoning_effort": False},
     },
 }

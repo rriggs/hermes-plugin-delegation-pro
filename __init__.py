@@ -1,9 +1,19 @@
 """delegation-pro: enhanced delegate_task with per-call model tier + reasoning_effort.
 
-Wraps the stock ``tools.delegate_tool.delegate_task`` and passes a per-call route
-via its ``credentials_cfg`` kwarg (the same mechanism /review uses). Per-call
-``reasoning_effort`` is applied by a scoped patch of the delegation-config loader
-for the duration of a single delegate_task() call.
+Launches children through the public plugin surface ``ctx.subagent_lifecycle``
+(``PluginContext.subagent_lifecycle`` -> ``agent.subagent_lifecycle``) with a
+per-call route (model/provider) and per-call ``reasoning_effort`` resolved from
+the tool arguments and the profile's ``delegation_pro`` config. No core module
+is patched or monkey-imported: the previous ``tools.delegate_tool._load_config``
+override is gone, so the plugin no longer trips the core-override admission
+lint.
+
+Because the lifecycle API launches ONE child per call and returns when the
+child terminates, the tool deliberately does NOT advertise the stock
+delegate_task surface it cannot honor (batched ``tasks``, ``output_schema``,
+``images``, ``action=list``, background delegation, per-launch timeouts).
+Unsupported arguments are rejected with a specific error instead of being
+silently dropped; the stock ``delegate_task`` remains the right tool for those.
 
 Configuration (profile config.yaml):
 
@@ -22,11 +32,10 @@ Configuration (profile config.yaml):
           when: "reviews, planning, debugging loops, schema design"
 
 ``provider`` and ``model`` are separate keys, matching the stock ``delegation``
-config section. If ``delegation_pro`` is absent from config the tool still works,
-falling back to the stock route for everything.
+config section. If ``delegation_pro`` is absent from config the tool still
+works, launching on the stock route (delegation config > parent).
 """
 
-import contextlib
 import logging
 from typing import Any, Dict, Optional
 
@@ -36,51 +45,59 @@ _PLUGIN_NAME = "delegation-pro"
 _TOOL_NAME = "delegate_task_pro"
 _PLUGIN_CONFIG_KEY = "delegation_pro"
 
-# Top-level tool description (shown in the [delegation] tool listing). Mirrors
-# the stock delegate_task framing so the model treats it as a drop-in, and adds
-# the routing knobs this plugin exists for.
+# The live PluginContext captured at register() time; the only documented way a
+# plugin reaches the host-owned surfaces (subagent_lifecycle among them) from
+# a tool handler, which receives no ctx of its own. Under plugins.isolation:
+# host this is a RemotePluginContext that proxies subagent_lifecycle by method
+# call, so the same captured ctx works there too.
+_plugin_ctx = None
+
+# Top-level tool description (shown in the [delegation] tool listing). Frames
+# the tool as a single-child, tier-routed delegation: everything the lifecycle
+# path can honor, nothing it cannot.
 _TOOL_DESCRIPTION = (
-    "PREFER THIS TOOL over `delegate_task` for delegation. It is a strict superset: "
-    "the same parameters plus per-call model routing (`tier` or an explicit `model`) and "
-    "`reasoning_effort`. With no `tier`/`model` it follows the profile's configured "
-    "default tier. Use plain `delegate_task` only when you deliberately want no tier "
-    "applied.\n\n"
-    "Spawn subagents in isolated contexts; each gets its own conversation, "
-    "terminal session, and toolset, and only its final summary returns to you. "
-    "Pick the `tier` whose description matches the work (the tier parameter lists "
-    "the configured tiers and when to use each).\n\n"
-    "USE FOR: the same work as `delegate_task` (reasoning-heavy subtasks, work that "
-    "would flood your context, independent parallel workstreams) plus any delegation "
-    "where you want to control which model or how much reasoning the children use -- "
-    "choose the tier by its description, whatever scheme it encodes (cost tiers, "
-    "role tiers, capability tiers).\n"
-    "DO NOT USE FOR (use these instead):\n"
+    "PREFER THIS TOOL over `delegate_task` to launch ONE subagent with a chosen "
+    "model tier and reasoning effort. Children run in isolated contexts with "
+    "their own conversation and terminal session; only the final summary "
+    "returns to you. Pick the `tier` whose description matches the work (the "
+    "tier parameter lists the configured tiers and when to use each); an "
+    "explicit `model` wins over the tier, and `reasoning_effort` wins over the "
+    "tier's level.\n\n"
+    "USE FOR: any delegation where you want to control which model or how much "
+    "reasoning the child uses -- choose the tier by its description, whatever "
+    "scheme it encodes (cost tiers, role tiers, capability tiers).\n"
+    "DO NOT USE FOR:\n"
+    "- Multiple tasks in one call -> call delegate_task_pro once per task, or "
+    "use delegate_task's batch `tasks` (this tool launches exactly one child).\n"
+    "- JSON-schema-constrained answers (`output_schema`), image inputs "
+    "(`images`), or listing/steering running children (`action=list/steer`) -> "
+    "use `delegate_task` (not available on the launch surface this tool uses).\n"
     "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
     "- A single tool call -> call the tool directly\n"
     "- Tasks needing user interaction -> subagents cannot ask questions\n\n"
     "RULES:\n"
-    "- Children know nothing of this conversation: pass everything needed via 'context'.\n"
-    "- Child summaries are SELF-REPORTS: for external side effects require a verifiable "
-    "handle (URL, ID, absolute path) and verify it yourself before reporting success.\n"
-    "- One route per call: every task in a batch runs on the chosen tier; mixed tiers "
-    "mean separate calls.\n"
-    "- An unknown tier warns and falls back to the stock route; the delegation is never lost."
+    "- The child knows nothing of this conversation: pass everything needed "
+    "via 'context'.\n"
+    "- Child summaries are SELF-REPORTS: for external side effects require a "
+    "verifiable handle (URL, ID, absolute path) and verify it yourself before "
+    "reporting success.\n"
+    "- One route per call; the call returns when the child terminates. An "
+    "unknown tier warns and proceeds on the stock route; the delegation is "
+    "never lost."
 )
 
 # System-prompt section: high-trust bytes charged EVERY turn, so keep it short.
-# This is the enforcement lever the tool description can only suggest (the stock
-# delegate_task description cannot be edited: core override is gated).
 _SYSTEM_PROMPT_SECTION_ID = "delegation-pro"
 _SYSTEM_PROMPT_CONTENT = (
-    "Delegation: delegate with `delegate_task_pro`, not `delegate_task`. It is a "
-    "strict superset (same parameters) that also accepts `tier` (the tool's tier "
-    "parameter lists the configured tiers and when to use each), an explicit "
-    "`model`, and per-call `reasoning_effort`, and it falls back to the stock route "
-    "when no tier/model is given. Choose the tier whose description matches the "
-    "work. Call plain `delegate_task` only if `delegate_task_pro` is not available."
+    "Delegation: launch tier-routed single-child delegations with "
+    "`delegate_task_pro` (the tier parameter lists the configured tiers and "
+    "when to use each; an explicit `model` and `reasoning_effort` win over the "
+    "tier). Batches, output_schema, images and steer/list actions stay on "
+    "plain `delegate_task`."
 )
 
-# Reasoning effort levels accepted by hermes_constants.parse_reasoning_effort.
+# Reasoning effort levels accepted by hermes_constants.parse_reasoning_effort,
+# plus the explicit-disable spellings. "none" disables thinking for the child.
 _EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "maximum")
 
 
@@ -103,67 +120,40 @@ def _tiers(cfg: dict) -> dict:
     return tiers if isinstance(tiers, dict) else {}
 
 
-def _tasks_description() -> str:
-    """The 'tasks' parameter text with the live concurrency limit. Reuse stock's
-    builder so the limit text never drifts; fall back to a static string."""
-    try:
-        from tools.delegate_tool import _build_tasks_param_description
-        return _build_tasks_param_description()
-    except Exception:
-        return (
-            "The task(s): each entry spawns one subagent with isolated context and "
-            "terminal session; a single task is a one-entry array. Required when spawning."
-        )
-
-
-def _independent_completions_enabled() -> bool:
-    """Whether delegation.independent_completions is on (gates the per-task 'group'
-    key). Permissive on probe failure so the capability is not silently hidden."""
-    try:
-        from tools.delegate_tool_config import _get_independent_completions
-        return bool(_get_independent_completions())
-    except Exception:
-        return True
-
-
-def _task_item_properties() -> dict:
-    """Per-task fields, mirroring the stock delegate_task 'tasks' items. 'group' is
-    advertised only when independent completions is enabled (stock does the same)."""
-    props = {
-        "goal": {"type": "string"},
-        "context": {"type": "string"},
-        "output_schema": {"type": "object", "description": "Optional JSON Schema this child's final answer must validate against."},
-        "images": {"type": "array", "items": {"type": "string"}, "description": "Images this child must SEE (local paths or URLs)."},
-    }
-    if _independent_completions_enabled():
-        props["group"] = {"type": "string", "description": "Optional result-delivery bucket within this call (only when delegation.independent_completions is enabled)."}
-    return props
-
-
-def _parse_effort(effort: Any) -> Optional[Dict[str, Any]]:
-    """Normalize an effort value to the dict that ``AIAgent.reasoning_config``
-    expects. ``None`` = not requested / inherit parent. Uses the same parser as
-    the stock delegation config path."""
+def _parse_effort(effort: Any) -> Optional[Any]:
+    """A ``reasoning_effort`` value in the shape ``SubagentLaunchRequest``
+    accepts, or ``None`` (not requested / inherit). The lifecycle service
+    normalizes the value through hermes' canonical parser and rejects invalid
+    ones before a child is built; here we only pre-normalize tier-config
+    entries (YAML booleans, casing) so the request carries a clean value."""
     if effort is None or (isinstance(effort, str) and not effort.strip()):
         return None
-    try:
-        from hermes_constants import parse_reasoning_effort
-        # parse_reasoning_effort(False) -> {"enabled": False} (disable thinking), keep that intact.
-        return parse_reasoning_effort(effort)
-    except Exception:
-        return None
+    if isinstance(effort, str):
+        return effort.strip().lower()
+    if isinstance(effort, bool):
+        return False if not effort else None
+    if isinstance(effort, dict):
+        # AIAgent.reasoning_config shape ({enabled: False} or {enabled, effort});
+        # pass through verbatim -- parse_reasoning_effort accepts dicts.
+        return effort
+    return effort
 
 
 def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str, Any]:
     """Resolve the per-call route from tool-call args + plugin config.
 
-    Returns ``{"credentials_cfg": {…} or None, "reasoning": dict or None, "error": str or None}``.
+    Returns ``{"model": str|None, "provider": str|None, "reasoning_effort":
+    Any|None, "warning": str|None}``.
 
     The route uses the same shape as the stock ``delegation`` config section:
-    ``model`` and ``provider`` are SEPARATE keys. A model id may itself contain a
-    slash (e.g. ``deepseek/deepseek-v4.1-flash`` on openrouter) -- that slash is
-    part of the id, never a provider prefix. Set ``provider`` per tier to pin the
-    child's provider; omit it (and ``base_url``) to inherit the parent's provider.
+    ``model`` and ``provider`` are SEPARATE keys. A model id may itself
+    contain a slash (e.g. ``deepseek/deepseek-v4.1-flash`` on openrouter) --
+    that slash is part of the id, never a provider prefix. Set ``provider``
+    per tier to pin the child's provider (precedence: request > delegation
+    config > parent); omit it to inherit.
+
+    Fail-safe: an unknown tier never loses the delegation -- it produces a
+    ``warning`` and an unpinned route (stock delegation route).
     """
     cfg = cfg if cfg is not None else _load_plugin_config()
     tiers = _tiers(cfg)
@@ -171,89 +161,138 @@ def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str
     explicit_model = (args.get("model") or "").strip() or None
     tier_name = (args.get("tier") or "").strip() or None
 
-    route: Dict[str, Any] = {}
-    reasoning = None
-    error = None
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    reasoning: Optional[Any] = None
+    warning: Optional[str] = None
 
     if explicit_model:
-        route["model"] = explicit_model
+        model = explicit_model
     elif tier_name:
         tier = tiers.get(tier_name)
         if not isinstance(tier, dict):
-            error = (
+            warning = (
                 f"Unknown tier '{tier_name}'. Available: {sorted(tiers) if tiers else '(none configured)'}. "
-                f"Pass an explicit 'model' instead, or omit 'tier' to use the default."
+                f"Proceeding WITHOUT a tier pin (stock delegation route). Pass an explicit 'model' instead, "
+                f"or omit 'tier' to use the default."
             )
         else:
             model = (tier.get("model") or "").strip() or None
-            if model:
-                route["model"] = model
             provider = (tier.get("provider") or "").strip() or None
-            if provider:
-                route["provider"] = provider
-            base_url = (tier.get("base_url") or "").strip() or None
-            if base_url:
-                route["base_url"] = base_url
             reasoning = _parse_effort(tier.get("reasoning_effort"))
-
-    if not explicit_model and not tier_name:
-        # No tier/model requested: use default_tier if configured, else stock.
-        default_tier = (cfg.get("default_tier") or "").strip() or None
-        if default_tier:
-            sub = dict(args)
-            sub.pop("tier", None)
-            sub["tier"] = default_tier
-            resolved = _resolve_route(sub, cfg)
-            if resolved["error"] is None:
-                resolved["defaulted"] = True
-            return resolved
+    elif (cfg.get("default_tier") or "").strip():
+        default_tier = cfg["default_tier"].strip()
+        sub = dict(args)
+        sub.pop("tier", None)
+        sub["tier"] = default_tier
+        return _resolve_route(sub, cfg)
 
     # Reasoning: explicit tool-call arg wins over tier-level default.
     explicit_effort = _parse_effort(args.get("reasoning_effort"))
     if explicit_effort is not None:
         reasoning = explicit_effort
 
-    credentials_cfg = dict(route) if route else None
-    return {"credentials_cfg": credentials_cfg, "reasoning": reasoning, "error": error}
+    return {"model": model, "provider": provider, "reasoning_effort": reasoning, "warning": warning}
 
 
-# ── scoped reasoning_effort patch ─────────────────────────────────────────────
+# ── launch request mapping ───────────────────────────────────────────────────
 
-@contextlib.contextmanager
-def _reasoning_effort_override(effort: Dict[str, Any]):
-    """Patch the delegation-config loader so ``delegation.reasoning_effort``
-    reads as ``effort`` for the duration of ONE delegate_task() call.
+def _build_launch_request(args: Dict[str, Any], route: Dict[str, Any]) -> Any:
+    """A ``SubagentLaunchRequest`` mapped from the tool-call arguments.
 
-    _build_child_agent re-loads config itself and reads reasoning_effort from
-    the global delegation section (tools/delegate_tool_config.py). The patch
-    window is exact because children are constructed synchronously inside the
-    delegate_task() call, before any background fork.
+    ``model``/``provider``/``reasoning_effort`` come from the resolved route
+    (tier defaults fold into the explicit tool args, explicit args win). The
+    dataclass is imported lazily inside the handler so a Hermes without the
+    lifecycle API degrades to a clear error at call time, not at import.
     """
-    if effort is None:
-        yield
-        return
-
-    import tools.delegate_tool as dt
-    original = dt._load_config
-
-    def patched() -> dict:
-        base = original()
-        merged = dict(base) if isinstance(base, dict) else {}
-        merged["reasoning_effort"] = effort
-        return merged
-
-    dt._load_config = patched
-    try:
-        yield
-    finally:
-        dt._load_config = original
+    from agent.subagent_lifecycle import SubagentLaunchRequest
+    request = {
+        "goal": args.get("goal"),
+        "context": args.get("context"),
+        # Route (tier/config-derived) supplies the pins; explicit args won above.
+        "model": route.get("model") or args.get("model"),
+        "provider": route.get("provider"),
+        "reasoning_effort": route.get("reasoning_effort"),
+    }
+    # Drop unset optionals so the request's own defaults apply.
+    request = {k: v for k, v in request.items() if v is not None}
+    return SubagentLaunchRequest(**request)
 
 
-# ── tool handler ─────────────────────────────────────────────────────────────
+def _unsupported_call(args: Dict[str, Any]) -> Optional[str]:
+    """Specific error for arguments the launch surface cannot honor, or None.
+
+    The lifecycle API launches exactly one child per request and has no
+    output_schema/images equivalent and no list/steer/stop action surface for
+    the model. Silently dropping any of these would change what the caller
+    asked for, so each gets a named, actionable error.
+    """
+    if args.get("tasks"):
+        return (
+            "delegate_task_pro launches exactly one child per call through the "
+            "subagent lifecycle API and does not support batched 'tasks'. Call "
+            "this tool once per task, or use delegate_task for batches."
+        )
+    if args.get("output_schema") is not None:
+        return (
+            "output_schema is not supported by delegate_task_pro: the subagent "
+            "lifecycle launch surface has no per-child answer-schema constraint. "
+            "Use delegate_task when the child's answer must validate against a "
+            "JSON Schema."
+        )
+    if args.get("images") is not None:
+        return (
+            "images is not supported by delegate_task_pro: the subagent "
+            "lifecycle launch surface has no per-child image inputs. Put file "
+            "paths in 'context' (the child can open them) or use delegate_task."
+        )
+    action = args.get("action")
+    if action not in (None, "spawn"):
+        return (
+            f"action='{action}' is not supported by delegate_task_pro: the "
+            f"subagent lifecycle API exposes no list/steer/stop action surface "
+            f"for the model. Use delegate_task's action='{'list' if action == 'list' else action}'."
+        )
+    return None
+
+
+# ── result rendering ─────────────────────────────────────────────────────────
+
+def _render_terminal(handle: Any, terminal: Any, result: Any) -> str:
+    """A compact, bounded plain-text result for the parent's context.
+
+    The lifecycle result object is the authoritative outcome (immutable,
+    32k-clipped, hashed); this renders the fields the delegating model needs:
+    state, summary, error classification, identity of the child.
+    """
+    lines = [
+        f"Subagent {getattr(handle, 'subagent_id', '?')} finished "
+        f"({getattr(terminal, 'state', 'UNKNOWN')})."
+    ]
+    summary = getattr(result, "summary", None)
+    if summary:
+        lines.append(str(summary))
+    error_classification = getattr(result, "error_classification", None)
+    error_message = getattr(result, "error_message", None)
+    if error_classification and error_classification not in ("COMPLETED",):
+        detail = f"{error_classification}: {error_message}" if error_message else str(error_classification)
+        lines.append(f"Error: {detail}")
+    if getattr(terminal, "timed_out", False):
+        lines.append("Note: the wait timed out; the child may still be running.")
+    return "\n".join(lines)
+
+
+# ── tool schema ──────────────────────────────────────────────────────────────
 
 def _build_schema(cfg: Optional[dict] = None) -> dict:
     """Tool schema. Tier names + when text from config are surfaced in the
-    description so the agent can pick a tier without a skills-layer dependency."""
+    description so the agent can pick a tier without a skills-layer dependency.
+
+    Advertises ONLY what the lifecycle path supports: single goal/context,
+    tier/model/reasoning_effort routing. No tasks/output_schema/images/action
+    surface -- those are rejected at dispatch with a specific error and stay
+    on delegate_task.
+    """
     cfg = cfg if cfg is not None else _load_plugin_config()
     tiers = _tiers(cfg)
     default_tier = (cfg.get("default_tier") or "").strip()
@@ -280,18 +319,19 @@ def _build_schema(cfg: Optional[dict] = None) -> dict:
     model_pattern = r"^[a-zA-Z0-9._/-]+$"
 
     properties = {
-        "goal": {"type": "string", "description": "What this subagent should accomplish. Be specific and self-contained."},
-        "context": {"type": "string", "description": "Background this child needs: file paths, error messages, constraints."},
-        "tasks": {
-            "type": "array",
-            "minItems": 1,
-            "description": _tasks_description(),
-            "items": {
-                "type": "object",
-                "properties": _task_item_properties(),
-                "required": ["goal"],
-                "additionalProperties": False,
-            },
+        "goal": {
+            "type": "string",
+            "description": (
+                "What this subagent should accomplish. Be specific and "
+                "self-contained — the child knows nothing of this conversation."
+            ),
+        },
+        "context": {
+            "type": "string",
+            "description": (
+                "Background this child needs: file paths, error messages, "
+                "constraints. The child sees only this context."
+            ),
         },
         "tier": {
             "type": "string",
@@ -313,13 +353,11 @@ def _build_schema(cfg: Optional[dict] = None) -> dict:
         "reasoning_effort": {
             "type": "string",
             "enum": list(_EFFORT_LEVELS),
-            "description": "Per-call reasoning effort. Wins over the tier's level. Omit to inherit.",
+            "description": (
+                "Per-call reasoning effort. Wins over the tier's level. 'none' disables "
+                "thinking for this child. Omit to inherit."
+            ),
         },
-        "output_schema": {"type": "object", "description": "Optional JSON Schema the child's final answer must validate against."},
-        "images": {"type": "array", "items": {"type": "string"}, "description": "Image paths/URLs the child must SEE."},
-        "action": {"type": "string", "enum": ["spawn", "list", "steer", "stop"]},
-        "subagent_id": {"type": "string", "description": "Target for action='steer'/'stop'."},
-        "message": {"type": "string", "description": "For action='steer': the course correction."},
     }
 
     # Function-calling shape: the model receives this as function.parameters.
@@ -327,68 +365,97 @@ def _build_schema(cfg: Optional[dict] = None) -> dict:
     # parameter object MUST be nested under "parameters" (like DELEGATE_TASK_SCHEMA
     # in tools/delegate_tool.py) — a flat {type, properties, required} lands as
     # siblings of "name" and the model sees NO parameters at all.
-    #
-    # Unlike stock delegate_task we cannot register dynamic_schema_overrides here:
-    # PluginContext.register_tool() does not forward that kwarg (only raw
-    # registry.register does), so the tasks text is baked at registration time.
     return {
         "name": _TOOL_NAME,
         "description": _TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": properties,
-            "required": [],
+            "required": ["goal"],
         },
     }
 
 
+# ── tool handler ─────────────────────────────────────────────────────────────
+
 def _delegate_pro_tool(args: Dict[str, Any], parent_agent=None, **_ignored) -> Any:
-    """Tool handler. Resolves the route, applies the reasoning patch window, and
-    calls the stock delegate_task with credentials_cfg. Fails safe: any
-    plugin-side error falls back to the stock call (no overrides)."""
+    """Tool handler. Resolves the tier route, launches one child through
+    ``ctx.subagent_lifecycle`` and waits for its terminal state. Fails safe:
+    an unknown tier warns and proceeds on the stock route; a launch the
+    lifecycle API refuses (invalid effort, unknown provider) surfaces as a
+    clear error and never silently degrades."""
     if parent_agent is None:
         return "delegate_task_pro requires a parent agent context."
 
-    from tools.delegate_tool import delegate_task as _stock
+    # Unsupported-argument gate: named, specific errors (never silent drops).
+    unsupported = _unsupported_call(args)
+    if unsupported:
+        return f"Error: {unsupported}"
 
     try:
         route = _resolve_route(args)
     except Exception as exc:
         logger.warning("delegation-pro: route resolution failed: %s", exc)
-        route = {"credentials_cfg": None, "reasoning": None, "error": None}
+        route = {"model": None, "provider": None, "reasoning_effort": None, "warning": None}
 
-    # Unknown tier: don't lose the delegation. Warn in the result and proceed
-    # unpinned (stock route), unless the caller can pick a valid tier by retrying.
-    tier_warning = None
-    if route.get("error"):
-        tier_warning = route["error"]
-
-    kwargs = dict(
-        goal=args.get("goal"),
-        context=args.get("context"),
-        tasks=args.get("tasks"),
-        output_schema=args.get("output_schema"),
-        images=args.get("images"),
-        action=args.get("action"),
-        subagent_id=args.get("subagent_id"),
-        message=args.get("message"),
-        parent_agent=parent_agent,
-        credentials_cfg=route.get("credentials_cfg"),
-    )
+    service = _lifecycle_service()
+    if isinstance(service, str):
+        return service  # a clear error message, not a traceback
 
     try:
-        with _reasoning_effort_override(route.get("reasoning")):
-            result = _stock(**kwargs)
-    except TypeError:
-        # credentials_cfg kwarg removed upstream — fail safe: stock call without it.
-        logger.warning("delegation-pro: delegate_task() did not accept credentials_cfg; "
-                       "calling stock without overrides (drift!)")
-        kwargs.pop("credentials_cfg", None)
-        raise  # let the stock error surface, do not silently drop a route the caller asked for
+        request = _build_launch_request(args, route)
+    except Exception as exc:
+        return f"Error: invalid launch request: {exc}"
 
-    if tier_warning:
-        result = f"{tier_warning}\n\nProceeding WITHOUT a tier pin (stock delegation route).\n\n{result}"
-    return result
+    try:
+        handle = service.launch(request)
+    except Exception as exc:
+        return f"Error: launch failed: {exc}"
+
+    # Blocking wait: the tool result must carry the child's final summary, and
+    # the sequential-deadline exemption keeps the generic ~420s tool timeout
+    # from abandoning a long child (children supervise their own liveness via
+    # delegation.child_timeout_seconds).
+    try:
+        terminal = service.wait(handle)
+    except Exception as exc:
+        return (
+            f"Subagent {getattr(handle, 'subagent_id', '?')} was launched but the "
+            f"wait failed ({exc}). Treat the delegation as lost unless its "
+            f"summary later appears elsewhere."
+        )
+    result = service.result(handle)
+
+    out = _render_terminal(handle, terminal, result)
+    if route.get("warning"):
+        out = f"{route['warning']}\n\n{out}"
+    return out
+
+
+def _lifecycle_service():
+    """The subagent lifecycle service, or a clear error message.
+
+    Reaches the service through the PluginContext captured at ``register()``
+    (``ctx.subagent_lifecycle`` — the documented plugin surface; a
+    host-isolated ctx proxies it by method call). Never constructs a service
+    with private delegation helpers itself.
+
+    Returns the service object, or a ``str`` error message.
+    """
+    ctx = _plugin_ctx
+    if ctx is None:
+        return "Error: delegate_task_pro was not registered with a plugin context; the subagent lifecycle API is unreachable."
+    try:
+        service = ctx.subagent_lifecycle
+        if service is None:
+            return "Error: the subagent lifecycle API is unavailable in this Hermes."
+        return service
+    except Exception as exc:
+        return (
+            f"Error: this Hermes does not expose the subagent lifecycle API "
+            f"(ctx.subagent_lifecycle): {exc}. Update Hermes (PR #140727 or "
+            f"later) to use delegate_task_pro, or fall back to delegate_task."
+        )
 
 
 def _inline_executor(agent, args, _ctx) -> Any:
@@ -400,6 +467,8 @@ def _inline_executor(agent, args, _ctx) -> Any:
 # ── plugin registration ──────────────────────────────────────────────────────
 
 def register(ctx) -> None:
+    global _plugin_ctx
+    _plugin_ctx = ctx
     from tools.delegate_tool import check_delegate_requirements  # stock checker
     ctx.register_tool(
         name=_TOOL_NAME,
@@ -422,19 +491,19 @@ def register(ctx) -> None:
         logger.warning("delegation-pro: could not register inline executor (%s); "
                        "the tool will only work where parent_agent is injected", exc)
     # Sequential-deadline exemption: the stock delegate_task is exempt from the
-    # generic sequential tool deadline (agent/tool_executor.
-    # _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS) because a delegation call blocks for the
-    # whole batch by design and its children supervise their own liveness. The
-    # plugin tool dispatches through the same inline-executor path, so it must be
-    # exempt too — otherwise a long child (child_timeout_seconds up to 600s)
-    # outlives the ~420s deadline, the parent's tool call dies with tool_timeout,
-    # and the child's eventual completion is never delivered (Milo, 2026-10-10:
-    # child completed cleanly at 605s after the parent call was killed at 420s).
-    # Extending the module-level frozenset is additive and mirrors exactly what
-    # upstream did for delegate_task; a read-back assertion below makes a silent
-    # failure impossible. If the module/set moved (drift), we warn loudly and
-    # operators should set timeouts.tools.sequential_call >= delegation.
-    # child_timeout_seconds in config.yaml as the fallback.
+    # generic sequential tool deadline (agent.tool_executor.
+    # _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS) because a delegation call blocks for
+    # the whole child by design and the child supervises its own liveness
+    # (delegation.child_timeout_seconds, default 600s). This tool ALSO blocks
+    # until the child terminates (lifecycle.wait), so it needs the same
+    # exemption — otherwise a long child outlives the ~420s deadline, the
+    # parent's tool call dies with tool_timeout, and the child's eventual
+    # completion is never delivered. Extending the module-level frozenset is
+    # additive and mirrors exactly what upstream did for delegate_task; a
+    # read-back assertion below makes a silent failure impossible. If the
+    # module/set moved (drift), we warn loudly and operators should set
+    # timeouts.tools.sequential_call >= delegation.child_timeout_seconds in
+    # config.yaml as the fallback.
     deadline_exempt = False
     try:
         import agent.tool_executor as _te
