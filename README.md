@@ -113,4 +113,21 @@ One route per call, so a batch of separate calls may use different tiers.
   gone; `hermes plugins validate` no longer flags a core rebind for it, so the
   catalog-admission blocker is removed.
 
+## Integration test (opt-in)
+
+The end-to-end test needs a Hermes checkout whose `SubagentLaunchRequest` carries
+`reasoning_effort` (upstream PR #140727). It starts a local fake OpenAI-compatible
+endpoint, loads this plugin through the real `PluginManager`, launches via
+`ctx.subagent_lifecycle`, and asserts the tier's effort reaches the outgoing
+provider request (not the delegation default):
+
+```bash
+HERMES_LIFECYCLE_E2E=1 \
+HERMES_SRC=/path/to/hermes-pr140727 \
+PYTHONPATH=/path/to/hermes-pr140727 \
+python3 -m pytest tests/integration/test_lifecycle_end_to_end.py -q -s
+```
+
+It is skipped in the normal suite unless `HERMES_LIFECYCLE_E2E=1` is set.
+
 MIT. See LICENSE.
