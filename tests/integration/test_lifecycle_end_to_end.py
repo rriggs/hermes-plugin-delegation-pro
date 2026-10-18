@@ -5,18 +5,23 @@ This test is opt-in because it needs a Hermes checkout whose
 set ``HERMES_LIFECYCLE_E2E=1`` and ``HERMES_SRC`` to that checkout.
 
 It runs the real plugin through the real PluginManager, the real inline tool
-executor, the real SubagentLifecycleService and a real child AIAgent. The only
-substitution is the model endpoint: a local OpenAI-compatible server records
-every request body and answers with a fixed completion, so the test can assert
-the reasoning policy that would reach a provider without spend or network.
+executor, the real SubagentLifecycleService and a real child AIAgent.
 
-What it proves:
+Two endpoints are supported:
+  * default: a local OpenAI-compatible fake that records every request body and
+    answers with a fixed completion (no network, no spend);
+  * real: set ``HERMES_E2E_REAL_BASE_URL`` (and ``HERMES_E2E_REAL_MODEL``) to an
+    OpenAI-compatible server. A local recording proxy forwards to it, so the
+    test still asserts the exact outgoing effort while a real model answers.
+
+What both prove:
   * the plugin launches through ctx.subagent_lifecycle (no _load_config patch),
   * the request carries the tier's reasoning_effort,
   * the child is constructed with the matching reasoning_config_override,
   * the outgoing provider request carries that effort (not the delegation default),
   * the child's reply comes back through the tool result.
 """
+import http.client
 import json
 import os
 import shutil
@@ -25,6 +30,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -105,6 +111,67 @@ class _FakeOpenAI(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _proxy_handler_class(upstream_url: str):
+    parts = urlsplit(upstream_url)
+
+    class _RecordingProxy(BaseHTTPRequestHandler):
+        """Record the request, then forward it to a real OpenAI-compatible server."""
+
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format, *args):  # silence
+            pass
+
+        def _forward(self, method: str, body: bytes | None = None):
+            headers = {
+                k: v for k, v in self.headers.items()
+                if k.lower() not in ("host", "content-length", "connection")
+            }
+            conn = http.client.HTTPConnection(parts.hostname or "127.0.0.1", parts.port or 80, timeout=120)
+            try:
+                conn.request(method, self.path, body=body, headers=headers)
+                response = conn.getresponse()
+                payload = response.read()
+                status = response.status
+                response_headers = response.getheaders()
+            finally:
+                conn.close()
+
+            self.send_response(status)
+            for key, value in response_headers:
+                if key.lower() not in ("transfer-encoding", "content-length", "connection"):
+                    self.send_header(key, value)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            self._forward("GET")
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length)
+            try:
+                body = json.loads(raw or b"{}")
+            except Exception:
+                body = {}
+            with _LOCK:
+                _REQUESTS.append(body)
+            if not body.get("messages"):
+                # Client connectivity probe: answer locally instead of shipping
+                # an empty body to the real server.
+                payload = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            self._forward("POST", raw)
+
+    return _RecordingProxy
+
+
 @pytest.fixture()
 def fake_server():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeOpenAI)
@@ -118,7 +185,23 @@ def fake_server():
         thread.join(timeout=2)
 
 
-def _write_home(tmp_path: Path, base_url: str) -> Path:
+@pytest.fixture()
+def real_proxy():
+    upstream = os.environ.get("HERMES_E2E_REAL_BASE_URL")
+    if not upstream:
+        pytest.skip("set HERMES_E2E_REAL_BASE_URL to run against a real provider")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _proxy_handler_class(upstream))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def _write_home(tmp_path: Path, base_url: str, model: str) -> Path:
     home = tmp_path / "hermes-home"
     plugins = home / "plugins"
     plugins.mkdir(parents=True)
@@ -133,17 +216,17 @@ plugins:
 delegation:
   base_url: {base_url}
   api_key: fake-key
-  model: fake-model
+  model: {model}
   reasoning_effort: medium
 delegation_pro:
   default_tier: small
   tiers:
     small:
-      model: fake-model
+      model: {model}
       reasoning_effort: none
       when: trivial work
     medium:
-      model: fake-model
+      model: {model}
       reasoning_effort: low
       when: default work
 display:
@@ -156,8 +239,8 @@ security:
     return home
 
 
-def test_delegation_pro_launches_via_lifecycle_with_reasoning(fake_server, tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(_write_home(tmp_path, fake_server)))
+def _run_cases(base_url: str, model: str, expected_content: str, goal: str, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(_write_home(tmp_path, base_url, model)))
     hermes_src = os.environ.get("HERMES_SRC")
     assert hermes_src, "HERMES_SRC must point at the Hermes checkout with PR #140727"
     if hermes_src not in sys.path:
@@ -201,9 +284,9 @@ def test_delegation_pro_launches_via_lifecycle_with_reasoning(fake_server, tmp_p
         monkeypatch.setattr(delegate_tool, "_build_child_agent", recording_build)
 
         parent = AIAgent(
-            base_url=fake_server,
+            base_url=base_url,
             api_key="fake-key",
-            model="fake-model",
+            model=model,
             provider="custom",
             max_iterations=2,
             quiet_mode=True,
@@ -223,10 +306,10 @@ def test_delegation_pro_launches_via_lifecycle_with_reasoning(fake_server, tmp_p
                 with _LOCK:
                     _REQUESTS.clear()
 
-                result = executor(parent, {"goal": "Reply with OK", "tier": tier}, None)
+                result = executor(parent, {"goal": goal, "tier": tier}, None)
 
                 assert isinstance(result, str), result
-                assert "child-ok" in result, result
+                assert expected_content in result, result
                 assert launches, f"{tier}: plugin did not call SubagentLifecycleService.launch"
                 assert launches[-1].reasoning_effort == expected, (
                     f"{tier}: launch request carried {launches[-1].reasoning_effort!r}, "
@@ -259,3 +342,12 @@ def test_delegation_pro_launches_via_lifecycle_with_reasoning(fake_server, tmp_p
         )
     finally:
         manager.unload()
+
+
+def test_delegation_pro_launches_via_lifecycle_with_reasoning(fake_server, tmp_path, monkeypatch):
+    _run_cases(fake_server, "fake-model", "child-ok", "Reply with exactly: child-ok", tmp_path, monkeypatch)
+
+
+def test_delegation_pro_against_real_provider(real_proxy, tmp_path, monkeypatch):
+    model = os.environ.get("HERMES_E2E_REAL_MODEL", "ling-3.0-tiny")
+    _run_cases(real_proxy, model, "REAL_OK", "Reply with exactly: REAL_OK", tmp_path, monkeypatch)

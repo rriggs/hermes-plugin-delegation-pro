@@ -130,4 +130,17 @@ python3 -m pytest tests/integration/test_lifecycle_end_to_end.py -q -s
 
 It is skipped in the normal suite unless `HERMES_LIFECYCLE_E2E=1` is set.
 
+To run the same assertions against a real OpenAI-compatible server, point the
+test at it; a local recording proxy forwards the request so the outgoing effort
+is still asserted while a real model answers:
+
+```bash
+HERMES_LIFECYCLE_E2E=1 \
+HERMES_SRC=/path/to/hermes-pr140727 \
+PYTHONPATH=/path/to/hermes-pr140727 \
+HERMES_E2E_REAL_BASE_URL=http://10.100.0.3:30000/v1 \
+HERMES_E2E_REAL_MODEL=ling-3.0-tiny \
+python3 -m pytest tests/integration/test_lifecycle_end_to_end.py -q -s
+```
+
 MIT. See LICENSE.
