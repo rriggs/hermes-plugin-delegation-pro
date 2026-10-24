@@ -3,12 +3,22 @@
 ![Delegation Pro Logo](assets/delegation_pro.jpeg)
 
 Enhanced task delegation for Hermes Agent: per-call **model selection** (tiered)
-and per-call **reasoning_effort**, without touching the Hermes source tree.
+and per-call **reasoning_effort**, without patching the Hermes source tree.
 
-Upstream declined exposing these knobs on `delegate_task` itself
-(NousResearch/hermes-agent#56891), so this ships as an external plugin that
-piggybacks on the maintained internal plumbing (`credentials_cfg` per-call
-routing — the same mechanism `/review` uses).
+Upstream declined exposing these knobs on the model-facing `delegate_task`
+schema (NousResearch/hermes-agent#56891), so this ships as an external plugin
+that wraps the stock function. Two plugin-facing core knobs carry the routing:
+`credentials_cfg` (provider/model, the same mechanism `/review` uses) and
+`reasoning_effort` (the same policy a launch-local `SubagentLaunchRequest`
+applies). Everything else — batching, background dispatch, `action=list/steer/stop`,
+`output_schema`, `images` — is the stock function's own behavior.
+
+## Requirement
+
+The core must accept `delegate_task(..., reasoning_effort=...)`. Stock Hermes
+`main` does not; this line runs against the `internal/delegation-pro` core branch
+(see `DEPLOY.md`). On a core without the kwarg the call fails loudly instead of
+silently dropping the operator's effort.
 
 ## Install
 
@@ -68,6 +78,11 @@ delegation_pro:
 - `model` — explicit `provider/model` escape hatch, wins over tier
 - `reasoning_effort` — per-call level, wins over the tier's level
 
+The schema is derived from the core's own `delegate_task` parameters at
+registration time and the three routing controls are added on top, so a core
+change to the stock surface cannot leave the plugin advertising a stale copy
+(`test_schema_parity.py` pins this).
+
 The route is pinned per call via the internal `credentials_cfg` hook; children
 are built inside the call, before the sync/background fork, so backgrounded
 batches get the same route.
@@ -82,20 +97,23 @@ plugin side.
 - Fail-safe: a route resolution error (e.g. unknown tier) warns and proceeds
   with the stock route; the delegation is never lost.
 - Upstream drift is caught by the plugin's `test_drift.py` canaries
-  (`credentials_cfg` signature, reasoning-effort read site, inline-executor
-  table). If a hermes update breaks one, don't trust the plugin until it's
-  retargeted.
-- The per-call reasoning override is a scoped patch of the delegation-config
-  loader, restored after every call. `hermes plugins validate` will flag it
-  under `no core override` — that lint targets catalog admission; for local
-  installs it is advisory. This plugin is NOT intended for hub-catalog
-  submission while the patch is in place.
+  (`credentials_cfg` and `reasoning_effort` signatures, inline-executor table).
+  If a hermes update breaks one, don't trust the plugin until it's retargeted.
+- No core patch: the v1 monkeypatch of the delegation-config loader is gone. The
+  reasoning policy travels as a function kwarg, so there is no rebind of
+  `_load_config` and nothing to restore in a `finally`.
+- `hermes plugins validate` still reports the sequential-deadline exemption and
+  three private-core imports; those are catalog-admission lint, not runtime risk.
 
-## Known limits (v1)
+## Known limits
 
 - One route per call: a batch's tasks all run on the chosen tier. Mixed-tier
   batches mean separate calls.
 - The parent-agent handoff uses the agent loop's inline-executor table — an
   additive registration, not an override.
+- The sequential-deadline exemption is still added by rebinding a core frozenset.
+  It only matters for the synchronous paths (nested calls, no-result-consumer
+  sessions); a top-level call in a gateway/TUI session returns the stock
+  background handle immediately.
 
 MIT. See LICENSE.

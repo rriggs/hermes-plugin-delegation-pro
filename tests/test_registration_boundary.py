@@ -64,9 +64,8 @@ def test_schema_surface(plugin_module):
     assert "parameters" in schema, "schema must nest the parameter object under 'parameters'"
     assert schema["parameters"]["type"] == "object"
     props = schema["parameters"]["properties"]
-    # stock-compatible passthrough fields
-    for k in ("goal", "context", "tasks", "output_schema", "images",
-              "action", "subagent_id", "message"):
+    # the stock model-facing surface (derived from DELEGATE_TASK_SCHEMA, not copied)
+    for k in ("tasks", "action", "subagent_id", "message"):
         assert k in props, k
     # pro fields
     for k in ("tier", "model", "reasoning_effort"):
@@ -106,17 +105,15 @@ def test_handler_requires_parent_agent(plugin_module):
 
 
 def test_handler_passes_credentials_cfg(plugin_module, monkeypatch):
-    """The handler must forward the resolved route to the stock delegate_task,
-    with the reasoning patch active during the call, and restore afterwards."""
+    """The handler must forward the resolved route and reasoning policy to the
+    stock delegate_task as call kwargs, and leave the config loader untouched."""
     cfg = {"default_tier": "", "tiers": {"big": {"model": "prov/huge", "reasoning_effort": "high"}}}
     monkeypatch.setattr(plugin_module, "_load_plugin_config", lambda: cfg)
 
     captured = {}
 
     def fake_stock(**kwargs):
-        # capture what _load_config resolved to INSIDE the patch window
         captured.update(kwargs)
-        captured["config_during_call"] = dt._load_config()
         return "OK"
 
     from conftest import HERMES_SRC
@@ -131,9 +128,8 @@ def test_handler_passes_credentials_cfg(plugin_module, monkeypatch):
     result = plugin_module._delegate_pro_tool({"tier": "big"}, parent_agent=FakeParent())
     assert result == "OK"
     assert captured["credentials_cfg"] == {"model": "prov/huge"}
-    # reasoning patch active during the stock call
-    assert captured["config_during_call"]["reasoning_effort"] == {"enabled": True, "effort": "high"}
-    # and restored after
+    # reasoning travels as the core per-call kwarg, not as a patched loader
+    assert captured["reasoning_effort"] == {"enabled": True, "effort": "high"}
     assert dt._load_config is before
 
 

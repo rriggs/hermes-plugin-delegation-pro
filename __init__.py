@@ -1,9 +1,11 @@
 """delegation-pro: enhanced delegate_task with per-call model tier + reasoning_effort.
 
 Wraps the stock ``tools.delegate_tool.delegate_task`` and passes a per-call route
-via its ``credentials_cfg`` kwarg (the same mechanism /review uses). Per-call
-``reasoning_effort`` is applied by a scoped patch of the delegation-config loader
-for the duration of a single delegate_task() call.
+via its ``credentials_cfg`` kwarg (the same mechanism /review uses) plus the
+per-call ``reasoning_effort`` kwarg (the same policy a launch-local
+``SubagentLaunchRequest.reasoning_effort`` applies). Nothing in Hermes core is
+patched: the whole stock surface — batching, background dispatch, control
+actions, ``output_schema``, ``images`` — stays exactly as the built-in tool.
 
 Configuration (profile config.yaml):
 
@@ -26,7 +28,7 @@ config section. If ``delegation_pro`` is absent from config the tool still works
 falling back to the stock route for everything.
 """
 
-import contextlib
+import copy
 import logging
 from typing import Any, Dict, Optional
 
@@ -101,43 +103,6 @@ def _load_plugin_config() -> dict:
 def _tiers(cfg: dict) -> dict:
     tiers = cfg.get("tiers")
     return tiers if isinstance(tiers, dict) else {}
-
-
-def _tasks_description() -> str:
-    """The 'tasks' parameter text with the live concurrency limit. Reuse stock's
-    builder so the limit text never drifts; fall back to a static string."""
-    try:
-        from tools.delegate_tool import _build_tasks_param_description
-        return _build_tasks_param_description()
-    except Exception:
-        return (
-            "The task(s): each entry spawns one subagent with isolated context and "
-            "terminal session; a single task is a one-entry array. Required when spawning."
-        )
-
-
-def _independent_completions_enabled() -> bool:
-    """Whether delegation.independent_completions is on (gates the per-task 'group'
-    key). Permissive on probe failure so the capability is not silently hidden."""
-    try:
-        from tools.delegate_tool_config import _get_independent_completions
-        return bool(_get_independent_completions())
-    except Exception:
-        return True
-
-
-def _task_item_properties() -> dict:
-    """Per-task fields, mirroring the stock delegate_task 'tasks' items. 'group' is
-    advertised only when independent completions is enabled (stock does the same)."""
-    props = {
-        "goal": {"type": "string"},
-        "context": {"type": "string"},
-        "output_schema": {"type": "object", "description": "Optional JSON Schema this child's final answer must validate against."},
-        "images": {"type": "array", "items": {"type": "string"}, "description": "Images this child must SEE (local paths or URLs)."},
-    }
-    if _independent_completions_enabled():
-        props["group"] = {"type": "string", "description": "Optional result-delivery bucket within this call (only when delegation.independent_completions is enabled)."}
-    return props
 
 
 def _parse_effort(effort: Any) -> Optional[Dict[str, Any]]:
@@ -217,43 +182,36 @@ def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str
     return {"credentials_cfg": credentials_cfg, "reasoning": reasoning, "error": error}
 
 
-# ── scoped reasoning_effort patch ─────────────────────────────────────────────
-
-@contextlib.contextmanager
-def _reasoning_effort_override(effort: Dict[str, Any]):
-    """Patch the delegation-config loader so ``delegation.reasoning_effort``
-    reads as ``effort`` for the duration of ONE delegate_task() call.
-
-    _build_child_agent re-loads config itself and reads reasoning_effort from
-    the global delegation section (tools/delegate_tool_config.py). The patch
-    window is exact because children are constructed synchronously inside the
-    delegate_task() call, before any background fork.
-    """
-    if effort is None:
-        yield
-        return
-
-    import tools.delegate_tool as dt
-    original = dt._load_config
-
-    def patched() -> dict:
-        base = original()
-        merged = dict(base) if isinstance(base, dict) else {}
-        merged["reasoning_effort"] = effort
-        return merged
-
-    dt._load_config = patched
-    try:
-        yield
-    finally:
-        dt._load_config = original
-
-
 # ── tool handler ─────────────────────────────────────────────────────────────
 
+def _stock_parameters() -> Dict[str, Any]:
+    """The built-in ``delegate_task`` parameter object, derived — never copied.
+
+    Uses the stock dynamic-override builder when it is available so the tasks text
+    and the ``group`` gate match whatever the core currently advertises, and falls
+    back to the static schema. Deriving the base is what keeps this plugin's schema
+    a true superset instead of a snapshot that silently rots.
+    """
+    from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+
+    base = copy.deepcopy(DELEGATE_TASK_SCHEMA["parameters"])
+    try:
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+        dynamic = (_build_dynamic_schema_overrides() or {}).get("parameters") or {}
+        if isinstance(dynamic.get("properties"), dict):
+            base = copy.deepcopy(dynamic)
+    except Exception as exc:  # a moved builder must not break registration
+        logger.warning("delegation-pro: falling back to the static delegate_task "
+                       "schema (dynamic override builder unavailable: %s)", exc)
+    return base
+
+
 def _build_schema(cfg: Optional[dict] = None) -> dict:
-    """Tool schema. Tier names + when text from config are surfaced in the
-    description so the agent can pick a tier without a skills-layer dependency."""
+    """Tool schema: the stock parameter object plus the routing controls.
+
+    Tier names + ``when`` text from config are surfaced in the ``tier``
+    description so the agent can pick a tier without a skills-layer dependency.
+    """
     cfg = cfg if cfg is not None else _load_plugin_config()
     tiers = _tiers(cfg)
     default_tier = (cfg.get("default_tier") or "").strip()
@@ -279,48 +237,31 @@ def _build_schema(cfg: Optional[dict] = None) -> dict:
 
     model_pattern = r"^[a-zA-Z0-9._/-]+$"
 
-    properties = {
-        "goal": {"type": "string", "description": "What this subagent should accomplish. Be specific and self-contained."},
-        "context": {"type": "string", "description": "Background this child needs: file paths, error messages, constraints."},
-        "tasks": {
-            "type": "array",
-            "minItems": 1,
-            "description": _tasks_description(),
-            "items": {
-                "type": "object",
-                "properties": _task_item_properties(),
-                "required": ["goal"],
-                "additionalProperties": False,
-            },
-        },
-        "tier": {
-            "type": "string",
-            "description": (
-                f"Model tier for this subagent. Pick the tier whose description matches the "
-                f"work; each tier's 'when' text says what it is for.\n{tiers_text}\n"
-                f"Omit to use default_tier{f' ({default_tier})' if default_tier else ''}."
-            ),
-        },
-        "model": {
-            "type": "string",
-            "pattern": model_pattern,
-            "description": (
-                "Explicit model id escape hatch (bare id, no provider prefix -- a slash in the "
-                "id is part of the model, e.g. 'deepseek/deepseek-v4.1-flash'). Wins over tier. "
-                "The child's provider comes from the tier/config, not from this string."
-            ),
-        },
-        "reasoning_effort": {
-            "type": "string",
-            "enum": list(_EFFORT_LEVELS),
-            "description": "Per-call reasoning effort. Wins over the tier's level. Omit to inherit.",
-        },
-        "output_schema": {"type": "object", "description": "Optional JSON Schema the child's final answer must validate against."},
-        "images": {"type": "array", "items": {"type": "string"}, "description": "Image paths/URLs the child must SEE."},
-        "action": {"type": "string", "enum": ["spawn", "list", "steer", "stop"]},
-        "subagent_id": {"type": "string", "description": "Target for action='steer'/'stop'."},
-        "message": {"type": "string", "description": "For action='steer': the course correction."},
+    params = _stock_parameters()
+    properties = dict(params.get("properties") or {})
+    properties["tier"] = {
+        "type": "string",
+        "description": (
+            f"Model tier for this subagent. Pick the tier whose description matches the "
+            f"work; each tier's 'when' text says what it is for.\n{tiers_text}\n"
+            f"Omit to use default_tier{f' ({default_tier})' if default_tier else ''}."
+        ),
     }
+    properties["model"] = {
+        "type": "string",
+        "pattern": model_pattern,
+        "description": (
+            "Explicit model id escape hatch (bare id, no provider prefix -- a slash in the "
+            "id is part of the model, e.g. 'deepseek/deepseek-v4.1-flash'). Wins over tier. "
+            "The child's provider comes from the tier/config, not from this string."
+        ),
+    }
+    properties["reasoning_effort"] = {
+        "type": "string",
+        "enum": list(_EFFORT_LEVELS),
+        "description": "Per-call reasoning effort. Wins over the tier's level. Omit to inherit.",
+    }
+    params["properties"] = properties
 
     # Function-calling shape: the model receives this as function.parameters.
     # registry.get_definitions() does {**entry.schema, "name": entry.name}, so the
@@ -330,22 +271,20 @@ def _build_schema(cfg: Optional[dict] = None) -> dict:
     #
     # Unlike stock delegate_task we cannot register dynamic_schema_overrides here:
     # PluginContext.register_tool() does not forward that kwarg (only raw
-    # registry.register does), so the tasks text is baked at registration time.
+    # registry.register does), so the base is resolved once at registration time.
     return {
         "name": _TOOL_NAME,
         "description": _TOOL_DESCRIPTION,
-        "parameters": {
-            "type": "object",
-            "properties": properties,
-            "required": [],
-        },
+        "parameters": params,
     }
 
 
 def _delegate_pro_tool(args: Dict[str, Any], parent_agent=None, **_ignored) -> Any:
-    """Tool handler. Resolves the route, applies the reasoning patch window, and
-    calls the stock delegate_task with credentials_cfg. Fails safe: any
-    plugin-side error falls back to the stock call (no overrides)."""
+    """Tool handler. Resolves the route and calls the stock ``delegate_task`` with
+    ``credentials_cfg`` and ``reasoning_effort``. Every other argument is passed
+    through untouched, so batching, background dispatch, control actions,
+    ``output_schema`` and ``images`` behave exactly like the built-in tool.
+    Fails safe: any plugin-side error falls back to the stock call."""
     if parent_agent is None:
         return "delegate_task_pro requires a parent agent context."
 
@@ -374,17 +313,17 @@ def _delegate_pro_tool(args: Dict[str, Any], parent_agent=None, **_ignored) -> A
         message=args.get("message"),
         parent_agent=parent_agent,
         credentials_cfg=route.get("credentials_cfg"),
+        reasoning_effort=route.get("reasoning"),
     )
 
     try:
-        with _reasoning_effort_override(route.get("reasoning")):
-            result = _stock(**kwargs)
+        result = _stock(**kwargs)
     except TypeError:
-        # credentials_cfg kwarg removed upstream — fail safe: stock call without it.
-        logger.warning("delegation-pro: delegate_task() did not accept credentials_cfg; "
-                       "calling stock without overrides (drift!)")
-        kwargs.pop("credentials_cfg", None)
-        raise  # let the stock error surface, do not silently drop a route the caller asked for
+        # A core that predates the per-call reasoning kwarg (or credentials_cfg)
+        # would drop the routing silently; surface it instead of degrading.
+        logger.warning("delegation-pro: delegate_task() rejected the routing kwargs; "
+                       "this Hermes lacks per-call reasoning_effort (drift!)")
+        raise
 
     if tier_warning:
         result = f"{tier_warning}\n\nProceeding WITHOUT a tier pin (stock delegation route).\n\n{result}"

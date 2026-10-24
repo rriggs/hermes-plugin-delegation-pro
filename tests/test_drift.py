@@ -120,3 +120,15 @@ def test_sequential_deadline_exempt_set_present(plugin_module):
 def test_plugin_context_exposes_system_prompt_section_api():
     from hermes_cli.plugins import PluginContext
     assert hasattr(PluginContext, "register_system_prompt_section")
+
+def test_stock_delegate_task_accepts_the_reasoning_kwarg():
+    """The plugin's reasoning routing goes through this core kwarg. If a core
+    update drops or renames it, the plugin's routing would silently vanish —
+    fail here instead."""
+    import inspect
+
+    from tools.delegate_tool import delegate_task
+
+    params = inspect.signature(delegate_task).parameters
+    assert "reasoning_effort" in params, "core delegate_task lost the per-call reasoning_effort kwarg"
+    assert "credentials_cfg" in params, "core delegate_task lost the model-routing kwarg"
