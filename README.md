@@ -3,13 +3,22 @@
 ![Delegation Pro Logo](assets/delegation_pro.jpeg)
 
 Enhanced task delegation for Hermes Agent: per-call **model selection** (tiered)
-and per-call **reasoning_effort**, launched through the **public subagent
-lifecycle API** (`ctx.subagent_lifecycle`, Hermes PR #140727+) — no core module
-is patched.
+and per-call **reasoning_effort**, without patching the Hermes source tree.
 
-Upstream declined exposing these knobs on `delegate_task` itself
-(NousResearch/hermes-agent#56891); with the lifecycle API they arrive through
-the documented plugin surface instead.
+Upstream declined exposing these knobs on the model-facing `delegate_task`
+schema (NousResearch/hermes-agent#56891), so this ships as an external plugin
+that wraps the stock function. Two plugin-facing core knobs carry the routing:
+`credentials_cfg` (provider/model, the same mechanism `/review` uses) and
+`reasoning_effort` (the same policy a launch-local `SubagentLaunchRequest`
+applies). Everything else — batching, background dispatch, `action=list/steer/stop`,
+`output_schema`, `images` — is the stock function's own behavior.
+
+## Requirement
+
+The core must accept `delegate_task(..., reasoning_effort=...)`. Stock Hermes
+`main` does not; this line runs against the `internal/delegation-pro` core branch
+(see `DEPLOY.md`). On a core without the kwarg the call fails loudly instead of
+silently dropping the operator's effort.
 
 ## Install
 
@@ -18,7 +27,6 @@ hermes plugins install rriggs/hermes-plugin-delegation-pro
 hermes plugins enable delegation-pro
 ```
 
-Requires a Hermes build with `ctx.subagent_lifecycle` (PR #140727 or later).
 Each profile needs its own install (sub-profiles do not inherit the default
 profile's plugins).
 
@@ -47,110 +55,65 @@ delegation_pro:
 ```
 
 - `model` — exact model id the child runs on; `provider` — the provider that
-  serves it (precedence: request > `delegation` config > parent). Set BOTH per
-  tier, matching the stock `delegation` config section (`model:` + `provider:`
-  as separate keys). A slash in the model id is part of the id
-  (`deepseek/deepseek-v4.1-flash`), never a provider prefix. Omit `provider`
-  to inherit. Use LIVE model ids; if the provider retires a tag (404/410),
-  launch fails loudly rather than falling back.
-- Optional per-tier: `reasoning_effort` (`none` or `false` disables thinking;
-  any standard level pins it), `when` — surfaced in the tool schema so the
-  agent picks tiers by description, not by hardcoding.
+  serves it. Set BOTH per tier, matching the stock `delegation` config section
+  (`model:` + `provider:` as separate keys). A slash in the model id is part of
+  the id (`deepseek/deepseek-v4.1-flash`), never a provider prefix. Omit
+  `provider` (and `base_url`) to inherit the parent's provider. Use LIVE model
+  ids; if the provider retires a tag (404/410), delegation fails loudly rather
+  than falling back (pinned routes intentionally don't borrow the parent's
+  fallback chain).
+- Optional per-tier: `provider`, `base_url`, `reasoning_effort` (`none` disables
+  thinking; any standard level pins it), `when` — surfaced in the tool schema so
+  the agent picks tiers by description, not by hardcoding.
 - `default_tier` — used when the tool call omits `tier`.
 
 ## Tool
 
-`delegate_task_pro` launches **one child per call** with:
+`delegate_task_pro` mirrors `delegate_task`'s current behavior (the top-level
+`tasks`/`action`/`subagent_id`/`message` surface, per-task
+`goal`/`context`/`output_schema`/`images`, plus `group` when
+`delegation.independent_completions` is on) and adds:
 
-- `goal` — what the child should accomplish (required)
-- `context` — background the child needs
 - `tier` — model tier from config (default: `default_tier`)
-- `model` — explicit model id escape hatch, wins over tier
-- `reasoning_effort` — per-call level, wins over the tier's level; `none`
-  explicitly disables thinking
+- `model` — explicit `provider/model` escape hatch, wins over tier
+- `reasoning_effort` — per-call level, wins over the tier's level
 
-The call resolves the tier, builds a `SubagentLaunchRequest` (goal, context,
-model, provider, reasoning_effort) and launches it via
-`ctx.subagent_lifecycle.launch()`; the tool then waits for the child's
-terminal state and returns its final summary. `reasoning_effort` is normalized
-by Hermes' canonical parser; `False`/`"none"` are explicit disables and an
-invalid value fails the launch with a clear error *before* any child is built.
+The schema is derived from the core's own `delegate_task` parameters at
+registration time and the three routing controls are added on top, so a core
+change to the stock surface cannot leave the plugin advertising a stale copy
+(`test_schema_parity.py` pins this).
+
+The route is pinned per call via the internal `credentials_cfg` hook; children
+are built inside the call, before the sync/background fork, so backgrounded
+batches get the same route.
 
 The plugin also registers a short system-prompt section steering the agent to
-`delegate_task_pro` for tier-routed delegations.
-
-## Limits of the lifecycle surface (v2)
-
-The lifecycle API launches one child per request and returns when it
-terminates. The stock `delegate_task` surface that cannot be honored there is
-**not advertised and rejected with a specific error**, never silently dropped:
-
-| Stock feature | delegate_task_pro | Alternative |
-|---|---|---|
-| Batched `tasks` | rejected — one child per call | call once per task, or `delegate_task` |
-| `output_schema` | rejected | `delegate_task` |
-| `images` | rejected (put file paths in `context`) | `delegate_task` |
-| `action=list/steer/stop` | rejected (`spawn` is implicit) | `delegate_task` |
-| Background delegation | not offered — the call waits for the child | `delegate_task` |
-| Per-launch timeout | not offered (children are bounded by `delegation.child_timeout_seconds`) | config |
-
-One route per call, so a batch of separate calls may use different tiers.
+call `delegate_task_pro` instead of `delegate_task` — the stock description
+cannot be edited (core override is gated), so the preference is stated from the
+plugin side.
 
 ## Behavior and safety
 
-- Fail-safe: an unknown tier warns and proceeds on the stock route
-  (delegation config > parent); the delegation is never lost.
-- Launch errors (no active parent session, unresolvable provider, invalid
-  reasoning effort) surface as clear tool errors — never a silent degrade.
-- Child summaries are self-reports: verify external side effects yourself.
+- Fail-safe: a route resolution error (e.g. unknown tier) warns and proceeds
+  with the stock route; the delegation is never lost.
 - Upstream drift is caught by the plugin's `test_drift.py` canaries
-  (lifecycle request fields, PluginContext facade, inline-executor table,
-  and a behavioral canary proving no delegation-config loader is touched).
-- The tool keeps its sequential-tool-deadline exemption (an additive frozenset
-  extension, mirroring the stock `delegate_task` exemption) so a long child is
-  not abandoned by the generic ~420s tool timeout while the call waits on it.
-- No `_load_config` patch: the v1 monkeypatch is gone. `hermes plugins
-  validate` still fails on this plugin for two OTHER reasons (the
-  `_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS` rebind and three private core imports), so
-  catalog admission is NOT unblocked — do not claim otherwise.
+  (`credentials_cfg` and `reasoning_effort` signatures, inline-executor table).
+  If a hermes update breaks one, don't trust the plugin until it's retargeted.
+- No core patch: the v1 monkeypatch of the delegation-config loader is gone. The
+  reasoning policy travels as a function kwarg, so there is no rebind of
+  `_load_config` and nothing to restore in a `finally`.
+- `hermes plugins validate` still reports the sequential-deadline exemption and
+  three private-core imports; those are catalog-admission lint, not runtime risk.
 
-## Internal deployment (this branch)
+## Known limits
 
-`integration` is the line our own fleet runs; it carries the `main` history plus
-PR #2. It needs a Hermes whose `SubagentLaunchRequest` accepts `reasoning_effort`.
-Until upstream #140727 merges we run a patched core branch
-(`internal/delegation-pro` on the runtime checkout, built from runtime `main` +
-the five commits of #140727 and the F1 fix). See `DEPLOY.md`.
-
-
-## Integration test (opt-in)
-
-The end-to-end test needs a Hermes checkout whose `SubagentLaunchRequest` carries
-`reasoning_effort` (upstream PR #140727). It starts a local fake OpenAI-compatible
-endpoint, loads this plugin through the real `PluginManager`, launches via
-`ctx.subagent_lifecycle`, and asserts the tier's effort reaches the outgoing
-provider request (not the delegation default):
-
-```bash
-HERMES_LIFECYCLE_E2E=1 \
-HERMES_SRC=/path/to/hermes-pr140727 \
-PYTHONPATH=/path/to/hermes-pr140727 \
-python3 -m pytest tests/integration/test_lifecycle_end_to_end.py -q -s
-```
-
-It is skipped in the normal suite unless `HERMES_LIFECYCLE_E2E=1` is set.
-
-To run the same assertions against a real OpenAI-compatible server, point the
-test at it; a local recording proxy forwards the request so the outgoing effort
-is still asserted while a real model answers:
-
-```bash
-HERMES_LIFECYCLE_E2E=1 \
-HERMES_SRC=/path/to/hermes-pr140727 \
-PYTHONPATH=/path/to/hermes-pr140727 \
-HERMES_E2E_REAL_BASE_URL=http://10.100.0.3:30000/v1 \
-HERMES_E2E_REAL_MODEL=ling-3.0-tiny \
-python3 -m pytest tests/integration/test_lifecycle_end_to_end.py -q -s
-```
+- One route per call: a batch's tasks all run on the chosen tier. Mixed-tier
+  batches mean separate calls.
+- The parent-agent handoff uses the agent loop's inline-executor table — an
+  additive registration, not an override.
+- The sequential-deadline exemption is still added by rebinding a core frozenset.
+  It only matters for the synchronous paths (nested calls, no-result-consumer
+  sessions); a top-level call in a gateway/TUI session returns the stock
+  background handle immediately.
 
 MIT. See LICENSE.
