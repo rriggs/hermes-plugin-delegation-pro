@@ -109,9 +109,19 @@ One route per call, so a batch of separate calls may use different tiers.
 - The tool keeps its sequential-tool-deadline exemption (an additive frozenset
   extension, mirroring the stock `delegate_task` exemption) so a long child is
   not abandoned by the generic ~420s tool timeout while the call waits on it.
-- No core overrides: the v1 `tools.delegate_tool._load_config` monkeypatch is
-  gone; `hermes plugins validate` no longer flags a core rebind for it, so the
-  catalog-admission blocker is removed.
+- No `_load_config` patch: the v1 monkeypatch is gone. `hermes plugins
+  validate` still fails on this plugin for two OTHER reasons (the
+  `_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS` rebind and three private core imports), so
+  catalog admission is NOT unblocked — do not claim otherwise.
+
+## Internal deployment (this branch)
+
+`integration` is the line our own fleet runs; it carries the `main` history plus
+PR #2. It needs a Hermes whose `SubagentLaunchRequest` accepts `reasoning_effort`.
+Until upstream #140727 merges we run a patched core branch
+(`internal/delegation-pro` on the runtime checkout, built from runtime `main` +
+the five commits of #140727 and the F1 fix). See `DEPLOY.md`.
+
 
 ## Integration test (opt-in)
 
