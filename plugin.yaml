@@ -1,6 +1,6 @@
 name: delegation-pro
-version: 0.1.1
-description: "Enhanced delegate_task: per-call model tier selection and reasoning_effort, without touching Hermes core."
+version: 0.2.0
+description: "Enhanced delegate_task: per-call model tier selection and reasoning_effort via the public subagent lifecycle API, without touching Hermes core."
 author: Rob Riggs (rriggs)
 license: MIT
 kind: backend

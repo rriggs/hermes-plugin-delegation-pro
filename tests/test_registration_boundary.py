@@ -3,7 +3,7 @@ does and assert the declared tool set. No Hermes-plugin imports from the source
 tree — this tests the INSTALLED-shape plugin, not bundled source.
 
 Live registration with a real PluginManager is exercised by
-`hermes plugins validate` / live dogfood (Phase 5); this file asserts the
+`hermes plugins validate` / live dogfood; this file asserts the
 loader boundary and the declared surface only.
 """
 import sys
@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from conftest import _load_plugin_module, HERMES_SRC  # noqa: E402
 if HERMES_SRC not in sys.path:
     sys.path.insert(0, HERMES_SRC)
-import tools.delegate_tool as dt  # noqa: E402
 
 
 def test_plugin_shape(plugin_module):
@@ -21,7 +20,7 @@ def test_plugin_shape(plugin_module):
     assert plugin_module.register  # callable registration entry point
 
 
-def test_register_adds_tool_to_fake_ctx(plugin_module):
+def test_register_adds_tool_and_captures_ctx(plugin_module):
     registered = {}
     sections = {}
 
@@ -38,7 +37,15 @@ def test_register_adds_tool_to_fake_ctx(plugin_module):
             sections["id"] = id
             sections["content"] = content
 
-    plugin_module.register(FakeCtx())
+    ctx = FakeCtx()
+    before = plugin_module._plugin_ctx
+    try:
+        plugin_module.register(ctx)
+        # register() must capture the ctx so the handler can reach ctx.subagent_lifecycle.
+        assert plugin_module._plugin_ctx is ctx
+    finally:
+        plugin_module._plugin_ctx = before  # never leak between tests
+
     assert registered["name"] == "delegate_task_pro"
     assert registered["toolset"] == "delegation"
     assert callable(registered["handler"])
@@ -64,19 +71,15 @@ def test_schema_surface(plugin_module):
     assert "parameters" in schema, "schema must nest the parameter object under 'parameters'"
     assert schema["parameters"]["type"] == "object"
     props = schema["parameters"]["properties"]
-    # stock-compatible passthrough fields
-    for k in ("goal", "context", "tasks", "output_schema", "images",
-              "action", "subagent_id", "message"):
+    # lifecycle-supported fields only
+    for k in ("goal", "context", "tier", "model", "reasoning_effort"):
         assert k in props, k
-    # pro fields
-    for k in ("tier", "model", "reasoning_effort"):
-        assert k in props, k
-    # deprecated/ignored stock fields must NOT be advertised
-    assert "background" not in props
-    # per-task fields mirror the stock tasks items
-    task_props = props["tasks"]["items"]["properties"]
-    for k in ("goal", "context", "output_schema", "images"):
-        assert k in task_props, k
+    # goal is the one required parameter
+    assert schema["parameters"]["required"] == ["goal"]
+    # unsupported stock fields must NOT be advertised
+    for k in ("tasks", "output_schema", "images", "action", "subagent_id",
+              "message", "background"):
+        assert k not in props, f"schema must not advertise unsupported '{k}'"
     # tier descriptions surface 'when' text and the default marker
     tier_desc = props["tier"]["description"]
     assert "trivial" in tier_desc and "deep work" in tier_desc
@@ -90,8 +93,6 @@ def test_schema_definition_shape_definitions_ready(plugin_module):
     fn = {**schema, "name": plugin_module._TOOL_NAME}
     assert "parameters" in fn
     assert isinstance(fn["parameters"].get("properties"), dict) and fn["parameters"]["properties"]
-    # a flat schema would leave properties as a sibling of 'name' with no parameters
-    assert "properties" not in fn or fn.get("parameters")
 
 
 def test_schema_default_without_entry(plugin_module):
@@ -100,56 +101,6 @@ def test_schema_default_without_entry(plugin_module):
     assert "no tiers entry" in desc
 
 
-def test_handler_requires_parent_agent(plugin_module):
-    out = plugin_module._delegate_pro_tool({"tier": "large"}, parent_agent=None)
-    assert "parent agent context" in out
-
-
-def test_handler_passes_credentials_cfg(plugin_module, monkeypatch):
-    """The handler must forward the resolved route to the stock delegate_task,
-    with the reasoning patch active during the call, and restore afterwards."""
-    cfg = {"default_tier": "", "tiers": {"big": {"model": "prov/huge", "reasoning_effort": "high"}}}
-    monkeypatch.setattr(plugin_module, "_load_plugin_config", lambda: cfg)
-
-    captured = {}
-
-    def fake_stock(**kwargs):
-        # capture what _load_config resolved to INSIDE the patch window
-        captured.update(kwargs)
-        captured["config_during_call"] = dt._load_config()
-        return "OK"
-
-    from conftest import HERMES_SRC
-    if HERMES_SRC not in sys.path:
-        sys.path.insert(0, HERMES_SRC)
-    monkeypatch.setattr(dt, "delegate_task", fake_stock)
-
-    class FakeParent:
-        pass
-
-    before = dt._load_config
-    result = plugin_module._delegate_pro_tool({"tier": "big"}, parent_agent=FakeParent())
-    assert result == "OK"
-    assert captured["credentials_cfg"] == {"model": "prov/huge"}
-    # reasoning patch active during the stock call
-    assert captured["config_during_call"]["reasoning_effort"] == {"enabled": True, "effort": "high"}
-    # and restored after
-    assert dt._load_config is before
-
-
-def test_handler_unknown_tier_proceeds_with_warning(plugin_module, monkeypatch):
-    cfg = {"default_tier": "", "tiers": {}}
-    monkeypatch.setattr(plugin_module, "_load_plugin_config", lambda: cfg)
-
-    captured = {}
-    import sys as _sys
-    from conftest import HERMES_SRC
-    if HERMES_SRC not in _sys.path:
-        _sys.path.insert(0, HERMES_SRC)
-    import tools.delegate_tool as dt
-    monkeypatch.setattr(dt, "delegate_task", lambda **kw: captured.update(kw) or "OK")
-
-    result = plugin_module._delegate_pro_tool({"tier": "nope"}, parent_agent=object())
-    assert "Unknown tier" in result
-    assert "OK" in result
-    assert captured["credentials_cfg"] is None
+def test_schema_advertises_explicit_disable_level(plugin_module):
+    props = plugin_module._build_schema({})["parameters"]["properties"]
+    assert "none" in props["reasoning_effort"]["enum"]
