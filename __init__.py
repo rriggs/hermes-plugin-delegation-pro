@@ -32,6 +32,7 @@ import copy
 import inspect
 import json
 import logging
+import threading
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ _PLUGIN_CONFIG_KEY = "delegation_pro"
 # carry several directories whose plugin.yaml claims the same name (a stale checkout, an
 # un-hidden *.bak from a previous deploy); discovery loads exactly one of them, and
 # without this line the only symptom is old behavior at the same version number.
-_PLUGIN_BUILD = "2026-10-24-effort-guard"
+_PLUGIN_BUILD = "2026-10-24-effort-config-patch"
 
 # Top-level tool description (shown in the [delegation] tool listing). Mirrors
 # the stock delegate_task framing so the model treats it as a drop-in, and adds
@@ -131,6 +132,10 @@ def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str
 
     Returns ``{"credentials_cfg": {…} or None, "reasoning": dict or None, "error": str or None}``.
 
+    ``reasoning_raw`` carries the operator-written value (``"high"``, ``"none"``,
+    ``False``) because the stock core parses ``delegation.reasoning_effort`` itself:
+    the config-patch path must inject the raw form, never the parsed dict.
+
     The route uses the same shape as the stock ``delegation`` config section:
     ``model`` and ``provider`` are SEPARATE keys. A model id may itself contain a
     slash (e.g. ``deepseek/deepseek-v4.1-flash`` on openrouter) -- that slash is
@@ -145,6 +150,7 @@ def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str
 
     route: Dict[str, Any] = {}
     reasoning = None
+    reasoning_raw = None
     error = None
 
     if explicit_model:
@@ -167,6 +173,8 @@ def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str
             if base_url:
                 route["base_url"] = base_url
             reasoning = _parse_effort(tier.get("reasoning_effort"))
+            if reasoning is not None:
+                reasoning_raw = tier.get("reasoning_effort")
 
     if not explicit_model and not tier_name:
         # No tier/model requested: use default_tier if configured, else stock.
@@ -184,9 +192,59 @@ def _resolve_route(args: Dict[str, Any], cfg: Optional[dict] = None) -> Dict[str
     explicit_effort = _parse_effort(args.get("reasoning_effort"))
     if explicit_effort is not None:
         reasoning = explicit_effort
+        reasoning_raw = args.get("reasoning_effort")
 
     credentials_cfg = dict(route) if route else None
-    return {"credentials_cfg": credentials_cfg, "reasoning": reasoning, "error": error}
+    return {"credentials_cfg": credentials_cfg, "reasoning": reasoning,
+            "reasoning_raw": reasoning_raw, "error": error}
+
+
+# ── stock-core reasoning fallback (scoped config patch) ──────────────────────
+
+_LOAD_CONFIG_PATCH_LOCK = threading.Lock()
+_LOAD_CONFIG_PATCHED = False
+_EFFORT_TLS = threading.local()
+
+
+def _install_load_config_patch() -> bool:
+    """Install a THREAD-SCOPED ``delegation.reasoning_effort`` override.
+
+    Stock cores carry no per-call ``reasoning_effort``: they read the effort from
+    ``delegation.reasoning_effort`` inside the child builder, via ``_load_config``.
+    The wrapper is installed once per process and is inert unless the calling
+    thread set ``_EFFORT_TLS.effort``, so concurrent delegations on other threads
+    (and every child) see the untouched config. This is a core override, which the
+    plugin catalog forbids -- accepted deliberately: without it the effort knob is
+    dead on every stock host.
+    """
+    global _LOAD_CONFIG_PATCHED
+    try:
+        import tools.delegate_tool as dt
+    except Exception as exc:  # pragma: no cover - core import is load-bearing
+        logger.warning("delegation-pro: cannot import the stock delegate module: %s", exc)
+        return False
+    with _LOAD_CONFIG_PATCH_LOCK:
+        if _LOAD_CONFIG_PATCHED:
+            return True
+        original = getattr(dt, "_load_config", None)
+        if not callable(original):
+            logger.warning("delegation-pro: stock core has no _load_config; cannot apply the effort override")
+            return False
+
+        def patched() -> Any:
+            base = original()
+            effort = getattr(_EFFORT_TLS, "effort", None)
+            if effort is None:
+                return base
+            merged = dict(base) if isinstance(base, dict) else {}
+            merged["reasoning_effort"] = effort
+            return merged
+
+        dt._load_config = patched
+        _LOAD_CONFIG_PATCHED = True
+    logger.info("delegation-pro: stock core lacks per-call reasoning_effort; "
+                "installed a thread-scoped delegation.reasoning_effort patch")
+    return True
 
 
 # ── tool handler ─────────────────────────────────────────────────────────────
@@ -343,22 +401,29 @@ def _delegate_pro_tool(args: Dict[str, Any], parent_agent=None, **_ignored) -> A
         tier_warning = route["error"]
 
     # The per-call reasoning_effort kwarg exists only on cores carrying the
-    # delegation-pro deployment branch. A stock core has no such parameter, and
-    # passing it raises TypeError on EVERY call -- so tier routing, the whole point
-    # of the plugin, would be unavailable on those hosts. Probe the signature and
-    # drop the knob there, with a note in the result; the TypeError retry below
-    # covers a core whose signature we cannot read.
+    # delegation-pro deployment branch. A stock core has no such parameter and
+    # raises TypeError on EVERY call if handed one, so the effort rides in through
+    # the delegation-config patch instead (thread-scoped, installed on first need).
+    # Only when neither route works is the effort dropped, with a note; the
+    # TypeError retry below covers a core whose signature we cannot read.
     effort = route.get("reasoning")
     effort_note = None
+    config_effort = None
     if effort is not None and not _stock_accepts(_stock, "reasoning_effort"):
-        effort_note = (
-            "reasoning_effort was NOT applied: this Hermes core has no per-call "
-            "reasoning_effort (that knob ships on the delegation-pro core branch). "
-            "The tier's model/provider routing was still applied."
-        )
-        logger.warning("delegation-pro: core delegate_task() has no reasoning_effort "
-                       "parameter; dropping the effort for this call")
-        effort = None
+        raw_effort = route.get("reasoning_raw")
+        if raw_effort is not None and _install_load_config_patch():
+            config_effort = raw_effort
+            logger.info("delegation-pro: applying reasoning_effort=%r through the "
+                        "delegation-config patch (stock core)", raw_effort)
+        else:
+            effort_note = (
+                "reasoning_effort was NOT applied: this Hermes core has no per-call "
+                "reasoning_effort and the config fallback is unavailable. "
+                "The tier's model/provider routing was still applied."
+            )
+            logger.warning("delegation-pro: no per-call reasoning_effort and no config "
+                           "fallback; dropping the effort for this call")
+            effort = None
 
     # Dispatch mode is the stock tool's own decision, so it must be supplied the
     # way the stock inline executor supplies it: run_agent._dispatch_delegate_task
@@ -381,11 +446,17 @@ def _delegate_pro_tool(args: Dict[str, Any], parent_agent=None, **_ignored) -> A
         parent_agent=parent_agent,
         credentials_cfg=route.get("credentials_cfg"),
     )
-    if effort is not None:
+    if effort is not None and config_effort is None:
         kwargs["reasoning_effort"] = effort
 
     try:
-        result = _stock(**kwargs)
+        if config_effort is not None:
+            _EFFORT_TLS.effort = config_effort
+        try:
+            result = _stock(**kwargs)
+        finally:
+            if config_effort is not None:
+                _EFFORT_TLS.effort = None
     except TypeError as exc:
         if "reasoning_effort" in str(exc) and "reasoning_effort" in kwargs:
             # Signature probe could not see it (decorator, **kwargs wrapper, a core

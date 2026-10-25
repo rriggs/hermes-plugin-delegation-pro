@@ -72,7 +72,7 @@ def test_stock_only_arguments_are_passed_through_untouched(monkeypatch):
 
 
 def test_plugin_module_never_rebinds_the_config_loader():
-    """No `_load_config` patch, imported or applied: the loader is the core one."""
+    """Import/registration must not patch core; the fallback is lazy and thread-scoped."""
     from tools.delegate_tool_config import _load_config as core_loader
 
     assert not hasattr(plugin_module, "_reasoning_effort_override")
@@ -121,11 +121,13 @@ def test_unknown_tier_keeps_the_dispatch_handle_parseable(monkeypatch):
     assert "bogus" in payload["tier_warning"]
 
 
-def test_stock_core_without_the_effort_kwarg_still_delegates(monkeypatch):
-    """A stock core has no per-call reasoning_effort: drop the knob, keep the route.
+def test_stock_core_gets_the_effort_through_the_config_patch(monkeypatch):
+    """No per-call kwarg: the effort must reach the child builder anyway.
 
-    Passing it there raises TypeError on every call, which would take out tier
-    routing entirely on those hosts (measured on alex/hai/emerald, 2026-10-24).
+    Stock cores read ``delegation.reasoning_effort`` inside the child builder, so the
+    fallback injects the raw value into the config the builder reads. Measured on
+    alex/hai/emerald 2026-10-24: without this, every call raised TypeError on the
+    per-call kwarg and the tool was unusable.
     """
     import json
 
@@ -135,21 +137,48 @@ def test_stock_core_without_the_effort_kwarg_still_delegates(monkeypatch):
              images=None, action=None, subagent_id=None, message=None, parent_agent=None,
              credentials_cfg=None):
         seen.update({k: v for k, v in locals().items() if k != "fake"})
+        seen["cfg"] = dt._load_config()  # what the real child builder does
         return json.dumps({"status": "dispatched", "mode": "background", "count": 1})
 
     monkeypatch.setattr(dt, "delegate_task", fake)
+    monkeypatch.setattr(dt, "_load_config", dt._load_config)   # restored at teardown
+    monkeypatch.setattr(plugin_module, "_LOAD_CONFIG_PATCHED", False)
     cfg = {"default_tier": "local",
            "tiers": {"local": {"provider": "p", "model": "m", "reasoning_effort": "xhigh"}}}
     monkeypatch.setattr(plugin_module, "_load_plugin_config", lambda: cfg)
 
     out = plugin_module._delegate_pro_tool({"goal": "g"}, parent_agent=_Agent())
     payload = json.loads(out)
-    assert "reasoning_effort" not in seen
+    assert "reasoning_effort" not in seen, "the kwarg must not reach a core that cannot take it"
+    assert seen["cfg"]["reasoning_effort"] == "xhigh", "effort must ride in through the config"
     assert seen["credentials_cfg"]["model"] == "m"
     assert seen["credentials_cfg"]["provider"] == "p"
     assert seen["background"] is True
     assert payload["status"] == "dispatched"
-    assert "NOT applied" in payload["effort_warning"]
+    # Thread-scoped: the override is gone once the call returns.
+    assert dt._load_config().get("reasoning_effort") != "xhigh"
+
+
+def test_config_patch_is_not_installed_when_the_core_has_the_kwarg(monkeypatch):
+    """Diamond's core carries the per-call kwarg: never patch it there."""
+    from tools.delegate_tool_config import _load_config as core_loader
+
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return "OK"
+
+    monkeypatch.setattr(dt, "delegate_task", fake)
+    monkeypatch.setattr(plugin_module, "_LOAD_CONFIG_PATCHED", False)
+    monkeypatch.setattr(plugin_module, "_load_plugin_config",
+                        lambda: {"default_tier": "local",
+                                 "tiers": {"local": {"model": "m", "reasoning_effort": "high"}}})
+
+    plugin_module._delegate_pro_tool({"goal": "g"}, parent_agent=_Agent())
+    assert seen["reasoning_effort"] == {"enabled": True, "effort": "high"}
+    assert dt._load_config is core_loader
+    assert plugin_module._LOAD_CONFIG_PATCHED is False
 
 
 def test_effort_rejected_despite_the_probe_is_retried_without_it(monkeypatch):

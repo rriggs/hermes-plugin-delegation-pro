@@ -10,17 +10,23 @@ The plugin forwards every `delegate_task` argument untouched and adds `tier`,
 `action=list/steer/stop`, `output_schema` and `images` are the stock function's
 own behavior, not a reimplementation.
 
-The per-call `reasoning_effort` knob exists only on cores carrying our branch. The
-plugin probes `delegate_task`'s signature and drops the knob on a stock core (note in
-the tool result, warning in the log) instead of raising `TypeError` on every call, so
-tier model/provider routing works on every host and the effort is honored only where
-the core accepts it. A `TypeError` that names the kwarg anyway is retried without it.
+The per-call `reasoning_effort` knob exists only on cores carrying our branch. When the
+core lacks it, the plugin falls back to a scoped config patch: `tools.delegate_tool._load_config`
+is wrapped once per process and merges the requested effort into the delegation config the
+child builder reads, but ONLY for the calling thread (a `threading.local` gate), so
+concurrent delegations and every child see the untouched config. On a core with the kwarg
+the patch is never installed. If neither path is available the effort is dropped with an
+`effort_warning` in the result instead of failing the call.
 
-Measured 2026-10-24: deploying 0.3.0 to alex, hai and emerald (stock cores, no per-call
-kwarg) took out every `delegate_task_pro` call with `delegate_task() got an unexpected
-keyword argument 'reasoning_effort'` until this probe was added. Check before deploying
-to a new host: `grep -n "def delegate_task(" -A 8 ~/.hermes/hermes-agent/tools/delegate_tool.py`
-and look for `reasoning_effort` in the signature.
+This fallback is a core override, which the plugin catalog forbids. It is accepted
+deliberately: without it the effort knob is dead on every stock host, and passing the
+kwarg there raises `TypeError` on every call (measured 2026-10-24 on alex, hai and
+emerald, which took `delegate_task_pro` out entirely until the fallback landed).
+
+Check before deploying to a new host:
+`grep -n "def delegate_task(" -A 8 ~/.hermes/hermes-agent/tools/delegate_tool.py` and look
+for `reasoning_effort` in the signature. Either answer works, but expect the log line
+`installed a thread-scoped delegation.reasoning_effort patch` on stock cores.
 
 ## Core requirement
 
