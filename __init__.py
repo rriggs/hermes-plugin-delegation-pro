@@ -29,6 +29,7 @@ falling back to the stock route for everything.
 """
 
 import copy
+import inspect
 import json
 import logging
 from typing import Any, Dict, Optional
@@ -285,12 +286,45 @@ def _build_schema(cfg: Optional[dict] = None) -> dict:
     }
 
 
+def _stock_accepts(fn: Any, kwarg: str) -> bool:
+    """True when ``fn`` can take ``kwarg``: declared, or a ``**kwargs`` sink.
+
+    An unreadable signature returns True — the caller's TypeError retry is the
+    backstop, and optimistically passing the kwarg keeps behaviour identical on
+    cores that do carry it.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return True
+    if kwarg in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _attach_note(result: Any, key: str, note: str) -> Any:
+    """Embed a plugin note in a stock tool result without breaking its shape.
+
+    A background dispatch returns a JSON handle that the model and the runtime
+    parse as JSON, so the note rides INSIDE the envelope under ``key``. A plain
+    text result (or a non-dict payload) gets the note prefixed instead.
+    """
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return f"{note}\n\n{result}"
+    if isinstance(payload, dict):
+        payload[key] = note
+        return json.dumps(payload)
+    return f"{note}\n\n{result}"
+
+
 def _delegate_pro_tool(args: Dict[str, Any], parent_agent=None, **_ignored) -> Any:
     """Tool handler. Resolves the route and calls the stock ``delegate_task`` with
-    ``credentials_cfg`` and ``reasoning_effort``. Every other argument is passed
-    through untouched, so batching, background dispatch, control actions,
-    ``output_schema`` and ``images`` behave exactly like the built-in tool.
-    Fails safe: any plugin-side error falls back to the stock call."""
+    ``credentials_cfg`` and, where the core supports it, ``reasoning_effort``. Every
+    other argument is passed through untouched, so batching, background dispatch,
+    control actions, ``output_schema`` and ``images`` behave exactly like the
+    built-in tool. Fails safe: any plugin-side error falls back to the stock call."""
     if parent_agent is None:
         return "delegate_task_pro requires a parent agent context."
 
@@ -307,6 +341,24 @@ def _delegate_pro_tool(args: Dict[str, Any], parent_agent=None, **_ignored) -> A
     tier_warning = None
     if route.get("error"):
         tier_warning = route["error"]
+
+    # The per-call reasoning_effort kwarg exists only on cores carrying the
+    # delegation-pro deployment branch. A stock core has no such parameter, and
+    # passing it raises TypeError on EVERY call -- so tier routing, the whole point
+    # of the plugin, would be unavailable on those hosts. Probe the signature and
+    # drop the knob there, with a note in the result; the TypeError retry below
+    # covers a core whose signature we cannot read.
+    effort = route.get("reasoning")
+    effort_note = None
+    if effort is not None and not _stock_accepts(_stock, "reasoning_effort"):
+        effort_note = (
+            "reasoning_effort was NOT applied: this Hermes core has no per-call "
+            "reasoning_effort (that knob ships on the delegation-pro core branch). "
+            "The tier's model/provider routing was still applied."
+        )
+        logger.warning("delegation-pro: core delegate_task() has no reasoning_effort "
+                       "parameter; dropping the effort for this call")
+        effort = None
 
     # Dispatch mode is the stock tool's own decision, so it must be supplied the
     # way the stock inline executor supplies it: run_agent._dispatch_delegate_task
@@ -328,32 +380,33 @@ def _delegate_pro_tool(args: Dict[str, Any], parent_agent=None, **_ignored) -> A
         message=args.get("message"),
         parent_agent=parent_agent,
         credentials_cfg=route.get("credentials_cfg"),
-        reasoning_effort=route.get("reasoning"),
     )
+    if effort is not None:
+        kwargs["reasoning_effort"] = effort
 
     try:
         result = _stock(**kwargs)
-    except TypeError:
-        # A core that predates the per-call reasoning kwarg (or credentials_cfg)
-        # would drop the routing silently; surface it instead of degrading.
-        logger.warning("delegation-pro: delegate_task() rejected the routing kwargs; "
-                       "this Hermes lacks per-call reasoning_effort (drift!)")
-        raise
+    except TypeError as exc:
+        if "reasoning_effort" in str(exc) and "reasoning_effort" in kwargs:
+            # Signature probe could not see it (decorator, **kwargs wrapper, a core
+            # that moved the parameter): degrade instead of breaking delegation.
+            logger.warning("delegation-pro: delegate_task() rejected reasoning_effort "
+                           "despite the signature probe; retrying without it")
+            kwargs.pop("reasoning_effort")
+            effort_note = (
+                "reasoning_effort was NOT applied: this Hermes core rejected the "
+                "per-call kwarg. Tier model/provider routing was still applied."
+            )
+            result = _stock(**kwargs)
+        else:
+            logger.warning("delegation-pro: delegate_task() rejected the routing kwargs (%s)", exc)
+            raise
 
     if tier_warning:
         note = f"{tier_warning}\n\nProceeding WITHOUT a tier pin (stock delegation route)."
-        # A background dispatch returns a JSON handle the model (and the runtime)
-        # read as JSON, so the note rides inside it instead of prefixing the blob.
-        try:
-            payload = json.loads(result)
-        except (TypeError, ValueError):
-            result = f"{note}\n\n{result}"
-        else:
-            if isinstance(payload, dict):
-                payload["tier_warning"] = note
-                result = json.dumps(payload)
-            else:
-                result = f"{note}\n\n{result}"
+        result = _attach_note(result, "tier_warning", note)
+    if effort_note:
+        result = _attach_note(result, "effort_warning", effort_note)
     return result
 
 

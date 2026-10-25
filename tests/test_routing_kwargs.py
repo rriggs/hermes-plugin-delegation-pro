@@ -47,11 +47,13 @@ def test_explicit_disable_reaches_the_kwarg_as_a_disable(monkeypatch):
     assert seen["reasoning_effort"] == {"enabled": False}
 
 
-def test_no_reasoning_requested_leaves_the_kwarg_none(monkeypatch):
+def test_no_reasoning_requested_omits_the_kwarg(monkeypatch):
+    """Omitted, not None: an absent effort inherits the core's own policy, and a core
+    without the parameter must not see the name at all."""
     seen = _capture(monkeypatch)
     monkeypatch.setattr(plugin_module, "_load_plugin_config", lambda: {})
     plugin_module._delegate_pro_tool({"goal": "g"}, parent_agent=object())
-    assert seen["reasoning_effort"] is None
+    assert "reasoning_effort" not in seen
 
 
 def test_stock_only_arguments_are_passed_through_untouched(monkeypatch):
@@ -117,3 +119,62 @@ def test_unknown_tier_keeps_the_dispatch_handle_parseable(monkeypatch):
     payload = json.loads(out)
     assert payload["status"] == "dispatched"
     assert "bogus" in payload["tier_warning"]
+
+
+def test_stock_core_without_the_effort_kwarg_still_delegates(monkeypatch):
+    """A stock core has no per-call reasoning_effort: drop the knob, keep the route.
+
+    Passing it there raises TypeError on every call, which would take out tier
+    routing entirely on those hosts (measured on alex/hai/emerald, 2026-10-24).
+    """
+    import json
+
+    seen = {}
+
+    def fake(goal=None, context=None, tasks=None, background=None, output_schema=None,
+             images=None, action=None, subagent_id=None, message=None, parent_agent=None,
+             credentials_cfg=None):
+        seen.update({k: v for k, v in locals().items() if k != "fake"})
+        return json.dumps({"status": "dispatched", "mode": "background", "count": 1})
+
+    monkeypatch.setattr(dt, "delegate_task", fake)
+    cfg = {"default_tier": "local",
+           "tiers": {"local": {"provider": "p", "model": "m", "reasoning_effort": "xhigh"}}}
+    monkeypatch.setattr(plugin_module, "_load_plugin_config", lambda: cfg)
+
+    out = plugin_module._delegate_pro_tool({"goal": "g"}, parent_agent=_Agent())
+    payload = json.loads(out)
+    assert "reasoning_effort" not in seen
+    assert seen["credentials_cfg"]["model"] == "m"
+    assert seen["credentials_cfg"]["provider"] == "p"
+    assert seen["background"] is True
+    assert payload["status"] == "dispatched"
+    assert "NOT applied" in payload["effort_warning"]
+
+
+def test_effort_rejected_despite_the_probe_is_retried_without_it(monkeypatch):
+    """Unreadable signature (wrapper, decorator) must degrade, not break."""
+    import json
+
+    calls = []
+
+    def fake(**kwargs):
+        calls.append(dict(kwargs))
+        if "reasoning_effort" in kwargs:
+            raise TypeError("delegate_task() got an unexpected keyword argument 'reasoning_effort'")
+        return json.dumps({"status": "dispatched", "mode": "background"})
+
+    monkeypatch.setattr(dt, "delegate_task", fake)
+    cfg = {"default_tier": "local", "tiers": {"local": {"model": "m", "reasoning_effort": "high"}}}
+    monkeypatch.setattr(plugin_module, "_load_plugin_config", lambda: cfg)
+
+    out = plugin_module._delegate_pro_tool({"goal": "g"}, parent_agent=_Agent())
+    assert len(calls) == 2
+    assert "reasoning_effort" not in calls[1]
+    payload = json.loads(out)
+    assert payload["status"] == "dispatched"
+    assert "NOT applied" in payload["effort_warning"]
+
+
+def test_attach_note_prefixes_plain_text_results():
+    assert plugin_module._attach_note("plain", "effort_warning", "note") == "note\n\nplain"

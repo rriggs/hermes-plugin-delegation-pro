@@ -10,9 +10,17 @@ The plugin forwards every `delegate_task` argument untouched and adds `tier`,
 `action=list/steer/stop`, `output_schema` and `images` are the stock function's
 own behavior, not a reimplementation.
 
-The core knob it needs is a per-call `reasoning_effort` on `delegate_task`. Our
-core branch adds it, so there is no monkeypatch and no narrowed surface. On a
-stock core the call fails loudly instead of dropping the operator's effort.
+The per-call `reasoning_effort` knob exists only on cores carrying our branch. The
+plugin probes `delegate_task`'s signature and drops the knob on a stock core (note in
+the tool result, warning in the log) instead of raising `TypeError` on every call, so
+tier model/provider routing works on every host and the effort is honored only where
+the core accepts it. A `TypeError` that names the kwarg anyway is retried without it.
+
+Measured 2026-10-24: deploying 0.3.0 to alex, hai and emerald (stock cores, no per-call
+kwarg) took out every `delegate_task_pro` call with `delegate_task() got an unexpected
+keyword argument 'reasoning_effort'` until this probe was added. Check before deploying
+to a new host: `grep -n "def delegate_task(" -A 8 ~/.hermes/hermes-agent/tools/delegate_tool.py`
+and look for `reasoning_effort` in the signature.
 
 ## Core requirement
 
