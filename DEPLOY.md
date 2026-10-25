@@ -46,23 +46,40 @@ Then in that profile's `config.yaml`: `delegation-pro` under `plugins.enabled`
 and a `delegation_pro:` tier block (`default_tier`,
 `tiers.<name>.{provider,model,reasoning_effort,when}`).
 
-A gateway restart IS required after changing plugin code. `plugins/plugin_loader.py`
-returns whatever module is already in `sys.modules`
-(`_load_plugin_module_locked`), and `register()` runs once per process, so every new
-session served by a running gateway reuses the `__init__.py` that process first
-imported. Measured 2026-10-24: the gateway (started 2026-10-22 17:10, last
-`delegation-pro registered` log line 17:10:49) served sessions at 20:20-20:23 with
-the pre-fix plugin after the fixed file was installed to the profile at 20:21:17.
-In that session `delegate_task_pro` at `tier=local` still blocked for the child's
-full 45.45s and returned a completed result inline, while stock `delegate_task` in
-the same session returned `{status: dispatched, mode: background}` immediately.
-So the foreground dispatch was a stale module object, not a broken fix: the installed
-file is byte-identical to the tested source and all 46 tests pass.
+### Deploy hazard: a duplicate plugin directory shadows the payload
 
-The core runtime module is a separate matter: `tools/delegate_tool.py` is re-imported
-per agent build, so a core-only patch does take effect on a running gateway
-(measured 2026-10-22 serving 0.3.0 plus the per-call kwarg with no restart). Restart
-whenever you deploy `__init__.py`; a core-only deploy can wait.
+Discovery builds one manifest per plugin key and lets a collision resolve to a single
+directory (`resolve_manifest_winners`). A profile that carries both `delegation-pro/`
+(the payload) and `hermes-plugin-delegation-pro/` (an older git checkout whose
+`plugin.yaml` also says `name: delegation-pro`) serves the checkout, not the payload.
+Measured 2026-10-24: the sven profile had been serving **0.1.1 from the git checkout**
+the whole time. Copying 0.3.0 into `plugins/delegation-pro/` at 20:21:17 and restarting
+the gateway at 20:27:39 changed nothing - the restart reloaded 0.1.1 from the same
+directory, and `delegate_task_pro` behaved exactly like the pre-fix code: tier=local
+blocked 45.45s and returned a completed child inline (stock `delegate_task` in the same
+session returned `{status: dispatched, mode: background}` immediately), and an unknown
+tier still emitted the old `Proceeding WITHOUT a tier pin` prefix instead of the JSON
+`tier_warning` key.
+
+Always check which directory won, right after install:
+
+```bash
+hermes -p <profile> plugins list | grep delegation-pro   # want: 0.3.0, source: user
+```
+
+A stale `hermes-plugin-delegation-pro/` shows up as `0.1.1 / source: git`. Retire it out
+of discovery (dot dirs are skipped) and re-check:
+
+```bash
+mv ~/.hermes/profiles/<profile>/plugins/hermes-plugin-delegation-pro \
+   ~/.hermes/profiles/<profile>/plugins/.hermes-plugin-delegation-pro.bak-$(date +%Y%m%dT%H%M%S)
+```
+
+A gateway restart is still required to pick up new plugin code: `plugin_loader` returns
+the module already in `sys.modules` (`_load_plugin_module_locked`) and `register()` runs
+once per process, so a running gateway keeps serving the `__init__.py` it first imported.
+Core-only patches (`tools/delegate_tool.py`) are re-imported per agent build and do land
+without a restart.
 
 ## Verify
 
