@@ -29,6 +29,7 @@ falling back to the stock route for everything.
 """
 
 import copy
+import json
 import logging
 from typing import Any, Dict, Optional
 
@@ -302,10 +303,19 @@ def _delegate_pro_tool(args: Dict[str, Any], parent_agent=None, **_ignored) -> A
     if route.get("error"):
         tier_warning = route["error"]
 
+    # Dispatch mode is the stock tool's own decision, so it must be supplied the
+    # way the stock inline executor supplies it: run_agent._dispatch_delegate_task
+    # passes ``background=not (depth > 0)``. Calling the stock function directly
+    # without it takes the Python default (background=False), which silently turns
+    # every top-level delegation into a blocking call: the parent's turn stalls for
+    # the whole batch and the model never gets the dispatch handle. Same rule as
+    # stock -- orchestrator subagents (depth > 0) stay synchronous because they
+    # need their workers' results inside their own turn.
     kwargs = dict(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=args.get("tasks"),
+        background=not (getattr(parent_agent, "_delegate_depth", 0) > 0),
         output_schema=args.get("output_schema"),
         images=args.get("images"),
         action=args.get("action"),
@@ -326,7 +336,19 @@ def _delegate_pro_tool(args: Dict[str, Any], parent_agent=None, **_ignored) -> A
         raise
 
     if tier_warning:
-        result = f"{tier_warning}\n\nProceeding WITHOUT a tier pin (stock delegation route).\n\n{result}"
+        note = f"{tier_warning}\n\nProceeding WITHOUT a tier pin (stock delegation route)."
+        # A background dispatch returns a JSON handle the model (and the runtime)
+        # read as JSON, so the note rides inside it instead of prefixing the blob.
+        try:
+            payload = json.loads(result)
+        except (TypeError, ValueError):
+            result = f"{note}\n\n{result}"
+        else:
+            if isinstance(payload, dict):
+                payload["tier_warning"] = note
+                result = json.dumps(payload)
+            else:
+                result = f"{note}\n\n{result}"
     return result
 
 

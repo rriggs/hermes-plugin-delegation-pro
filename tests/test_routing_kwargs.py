@@ -75,3 +75,45 @@ def test_plugin_module_never_rebinds_the_config_loader():
 
     assert not hasattr(plugin_module, "_reasoning_effort_override")
     assert dt._load_config is core_loader
+
+
+class _Agent:
+    """Minimal parent with the one attribute the dispatch decision reads."""
+
+    def __init__(self, depth=0):
+        self._delegate_depth = depth
+
+
+def test_top_level_delegation_dispatches_in_the_background(monkeypatch):
+    """Stock rule (run_agent._dispatch_delegate_task): depth 0 -> background.
+
+    Omitting `background` takes the stock function's Python default (False),
+    which blocks the parent's turn for the whole batch and never hands back a
+    dispatch handle.
+    """
+    seen = _capture(monkeypatch)
+    plugin_module._delegate_pro_tool({"goal": "g"}, parent_agent=_Agent(depth=0))
+    assert seen["background"] is True
+
+
+def test_orchestrator_subagent_stays_synchronous(monkeypatch):
+    """depth > 0 needs its workers' results inside its own turn, same as stock."""
+    seen = _capture(monkeypatch)
+    plugin_module._delegate_pro_tool({"goal": "g"}, parent_agent=_Agent(depth=1))
+    assert seen["background"] is False
+
+
+def test_unknown_tier_keeps_the_dispatch_handle_parseable(monkeypatch):
+    """The fallback note must not prefix-corrupt the JSON dispatch envelope."""
+    import json
+
+    def fake(**kwargs):
+        return json.dumps({"status": "dispatched", "mode": "background", "count": 1})
+
+    monkeypatch.setattr(dt, "delegate_task", fake)
+    monkeypatch.setattr(plugin_module, "_load_plugin_config", lambda: {"default_tier": "bogus", "tiers": {}})
+
+    out = plugin_module._delegate_pro_tool({"goal": "g"}, parent_agent=_Agent())
+    payload = json.loads(out)
+    assert payload["status"] == "dispatched"
+    assert "bogus" in payload["tier_warning"]

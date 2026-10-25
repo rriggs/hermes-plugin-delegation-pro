@@ -60,10 +60,17 @@ HERMES_SRC=~/.hermes/hermes-agent PYTHONPATH=~/.hermes/hermes-agent \
   <pytest-with-hermes-deps> -q
 ```
 
-43 tests: tier resolution, routing kwargs, schema parity against the live stock
-contract, drift canaries on both core kwargs, registration boundary. The core
-branch's own `tests/tools/test_delegate_launch_reasoning_kwarg.py` proves the
-effort reaches the outgoing provider request.
+The runtime venv has the Hermes deps but no pytest; a standalone pytest can borrow
+them: `PYTHONPATH=<runtime-venv>/lib/python3.14/site-packages ~/.local/bin/pytest -q`
+(both are CPython 3.14). Pointing `HERMES_SRC` at an older install tree instead of
+`~/.hermes/hermes-agent` fails the `reasoning_effort` drift canary — that canary is
+doing its job.
+
+46 tests: tier resolution, routing kwargs (including the background/sync dispatch
+decision), schema parity against the live stock contract, drift canaries on both core
+kwargs, registration boundary. The core branch's own
+`tests/tools/test_delegate_launch_reasoning_kwarg.py` proves the effort reaches the
+outgoing provider request.
 
 Live check after restart: one `delegate_task_pro` call at a tier with
 `reasoning_effort: none` and one at a tier with a level, then confirm the child
