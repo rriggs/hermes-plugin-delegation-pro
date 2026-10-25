@@ -43,7 +43,7 @@ _PLUGIN_CONFIG_KEY = "delegation_pro"
 # carry several directories whose plugin.yaml claims the same name (a stale checkout, an
 # un-hidden *.bak from a previous deploy); discovery loads exactly one of them, and
 # without this line the only symptom is old behavior at the same version number.
-_PLUGIN_BUILD = "2026-10-24-background-dispatch"
+_PLUGIN_BUILD = "2026-10-24-effort-guard"
 
 # Top-level tool description (shown in the [delegation] tool listing). Mirrors
 # the stock delegate_task framing so the model treats it as a drop-in, and adds
