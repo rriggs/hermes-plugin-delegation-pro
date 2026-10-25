@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 _PLUGIN_NAME = "delegation-pro"
 _TOOL_NAME = "delegate_task_pro"
 _PLUGIN_CONFIG_KEY = "delegation_pro"
+# Build marker: logged at register() time with the resolved file path. A profile can
+# carry several directories whose plugin.yaml claims the same name (a stale checkout, an
+# un-hidden *.bak from a previous deploy); discovery loads exactly one of them, and
+# without this line the only symptom is old behavior at the same version number.
+_PLUGIN_BUILD = "2026-10-24-background-dispatch"
 
 # Top-level tool description (shown in the [delegation] tool listing). Mirrors
 # the stock delegate_task framing so the model treats it as a drop-in, and adds
@@ -362,6 +367,7 @@ def _inline_executor(agent, args, _ctx) -> Any:
 
 def register(ctx) -> None:
     from tools.delegate_tool import check_delegate_requirements  # stock checker
+    logger.info("delegation-pro build %r loaded from %s", _PLUGIN_BUILD, __file__)
     ctx.register_tool(
         name=_TOOL_NAME,
         toolset="delegation",

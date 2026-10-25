@@ -65,15 +65,25 @@ Always check which directory won, right after install:
 
 ```bash
 hermes -p <profile> plugins list | grep delegation-pro   # want: 0.3.0, source: user
+grep "delegation-pro build" ~/.hermes/profiles/<profile>/logs/gateway.log | tail -1
 ```
 
-A stale `hermes-plugin-delegation-pro/` shows up as `0.1.1 / source: git`. Retire it out
-of discovery (dot dirs are skipped) and re-check:
+The version alone is not enough: a `delegation-pro.bak-<ts>` left by an earlier deploy is
+still discovered (only `_`/`.` prefixed dirs are skipped), carries the same
+`name: delegation-pro`, sorts after the live directory, and wins. That is exactly what
+happened on 2026-10-24: the backup held pre-fix 0.3.0, so `plugins list` reported 0.3.0
+while the pre-fix code ran. Every deploy backup must be dot-prefixed:
 
 ```bash
-mv ~/.hermes/profiles/<profile>/plugins/hermes-plugin-delegation-pro \
-   ~/.hermes/profiles/<profile>/plugins/.hermes-plugin-delegation-pro.bak-$(date +%Y%m%dT%H%M%S)
+mv ~/.hermes/profiles/<profile>/plugins/delegation-pro \
+   ~/.hermes/profiles/<profile>/plugins/.delegation-pro.bak-$(date +%Y%m%dT%H%M%S)
 ```
+
+The `delegation-pro build %r loaded from %s` line names the build and the exact file the
+gateway loaded, which is the only unambiguous check.
+
+A stale `hermes-plugin-delegation-pro/` (an old 0.1.1 git checkout) is the same hazard and
+shows up as `0.1.1 / source: git`. Retire it the same way.
 
 A gateway restart is still required to pick up new plugin code: `plugin_loader` returns
 the module already in `sys.modules` (`_load_plugin_module_locked`) and `register()` runs
