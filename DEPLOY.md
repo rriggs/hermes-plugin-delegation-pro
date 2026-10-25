@@ -46,8 +46,12 @@ Then in that profile's `config.yaml`: `delegation-pro` under `plugins.enabled`
 and a `delegation_pro:` tier block (`default_tier`,
 `tiers.<name>.{provider,model,reasoning_effort,when}`).
 
-A gateway restart is required: plugin code and the patched core modules are
-imported at process start.
+A gateway restart is not required for new sessions: plugin code is loaded per
+agent build, and a running gateway re-imports the patched delegation module
+(measured: a gateway started 2026-10-22 served 0.3.0 plus the per-call kwarg on
+2026-10-24 with no restart). It is still the only way to guarantee that warm,
+cached agents built before the deploy stop using the old module objects
+(`gateway/run_agent_cache.py`), so restart when convenient.
 
 ## Verify
 
