@@ -71,10 +71,17 @@ Keep the previous plugin directory beside the new one
 (`plugins/.delegation-pro.bak-<ts>`). Restore by moving it back and restarting the
 gateway. Core rollback is `git switch main` in the runtime checkout plus restart.
 
-## Remaining gap (issue #1)
+## Issue #1 status (delivery after a dead parent call)
 
-Surface parity is restored. What is still missing is the delivery side of issue
-#1: a synchronous call (a nested call, or a session with no later-result
-consumer) that outlives the tool deadline loses the child's completion. The
-sequential-deadline exemption papered over it by rebinding a core frozenset; the
-real fix is core-side delivery of a completion after the parent's call died.
+The incident's exact mechanism no longer applies to this line:
+
+- the sequential tool deadline is disarmed for `delegate_task_pro` by the
+  registration override (420.0 -> None once `register()` runs), and
+- a top-level call in a gateway/TUI session now takes the stock background path,
+  so it returns a dispatch handle instead of holding the turn open.
+
+What still stands is the general guarantee the issue asks for: if the parent's
+call dies by any other route (user interrupt, gateway restart, process crash, a
+different budget), a still-running child's completion is orphaned - there is no
+re-delivery and no sweep of completed-but-undelivered manifests. Issue #1's
+second half (sweep + re-deliver) is not implemented in core.
