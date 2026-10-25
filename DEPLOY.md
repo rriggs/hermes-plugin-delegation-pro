@@ -46,12 +46,23 @@ Then in that profile's `config.yaml`: `delegation-pro` under `plugins.enabled`
 and a `delegation_pro:` tier block (`default_tier`,
 `tiers.<name>.{provider,model,reasoning_effort,when}`).
 
-A gateway restart is not required for new sessions: plugin code is loaded per
-agent build, and a running gateway re-imports the patched delegation module
-(measured: a gateway started 2026-10-22 served 0.3.0 plus the per-call kwarg on
-2026-10-24 with no restart). It is still the only way to guarantee that warm,
-cached agents built before the deploy stop using the old module objects
-(`gateway/run_agent_cache.py`), so restart when convenient.
+A gateway restart IS required after changing plugin code. `plugins/plugin_loader.py`
+returns whatever module is already in `sys.modules`
+(`_load_plugin_module_locked`), and `register()` runs once per process, so every new
+session served by a running gateway reuses the `__init__.py` that process first
+imported. Measured 2026-10-24: the gateway (started 2026-10-22 17:10, last
+`delegation-pro registered` log line 17:10:49) served sessions at 20:20-20:23 with
+the pre-fix plugin after the fixed file was installed to the profile at 20:21:17.
+In that session `delegate_task_pro` at `tier=local` still blocked for the child's
+full 45.45s and returned a completed result inline, while stock `delegate_task` in
+the same session returned `{status: dispatched, mode: background}` immediately.
+So the foreground dispatch was a stale module object, not a broken fix: the installed
+file is byte-identical to the tested source and all 46 tests pass.
+
+The core runtime module is a separate matter: `tools/delegate_tool.py` is re-imported
+per agent build, so a core-only patch does take effect on a running gateway
+(measured 2026-10-22 serving 0.3.0 plus the per-call kwarg with no restart). Restart
+whenever you deploy `__init__.py`; a core-only deploy can wait.
 
 ## Verify
 
