@@ -1,7 +1,7 @@
 # Internal deployment (Mobilinkd fleet)
 
-Our deployment does not wait for upstream. `integration` is the branch the fleet
-runs: `main` plus the stock-wrapper work (0.3.0).
+Our deployment does not wait for upstream. `main` is the branch the fleet runs: the
+stock-wrapper work (0.3.0 and the fixes on top of it) lives there directly.
 
 ## What runs here
 
@@ -47,10 +47,10 @@ update so the core patch can be re-applied.
 ## Install
 
 The payload is `__init__.py`, `plugin.yaml`, `README.md`, `LICENSE`, `assets/`
-from the `integration` branch. Per profile (plugins are not inherited):
+from `main`. Per profile (plugins are not inherited):
 
 ```bash
-git -C <repo> archive integration | tar -x -C /tmp/dpro
+git -C <repo> archive main | tar -x -C /tmp/dpro
 cp /tmp/dpro/{__init__.py,plugin.yaml,README.md,LICENSE} \
    ~/.hermes/profiles/<profile>/plugins/delegation-pro/
 cp -r /tmp/dpro/assets ~/.hermes/profiles/<profile>/plugins/delegation-pro/
